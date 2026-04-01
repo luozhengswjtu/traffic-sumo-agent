@@ -669,6 +669,7 @@ class AgentOrchestrator:
             for value in (
                 command.scenario_type,
                 command.lane_count,
+                command.lane_delta,
                 command.road_length,
                 command.speed_limit,
                 command.duration_seconds,
