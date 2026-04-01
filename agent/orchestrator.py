@@ -572,28 +572,30 @@ class AgentOrchestrator:
             command.speed_limit = round(speed_value, 2)
 
         explicit_flow_match = re.search(r"流量(?:为|=|改成|设为|调整为|到|增加到|提高到|降低到|减少到)?\s*(\d{2,5})\s*(?:辆/小时|veh/h|vph)?", text, re.IGNORECASE)
+        has_explicit_flow_target = explicit_flow_match is not None
         if explicit_flow_match:
             command.flow_rate = int(explicit_flow_match.group(1))
             command.flow_level = self._infer_flow_level(command.flow_rate)
 
         increase_match = re.search(r"流量(?:提高|增加)\s*(\d+(?:\.\d+)?)%", text)
         decrease_match = re.search(r"流量(?:降低|减少)\s*(\d+(?:\.\d+)?)%", text)
-        if increase_match:
-            command.flow_multiplier = 1.0 + float(increase_match.group(1)) / 100.0
-        elif decrease_match:
-            command.flow_multiplier = max(0.0, 1.0 - float(decrease_match.group(1)) / 100.0)
-        elif any(token in text for token in ("增加流量", "提高流量", "加大流量", "流量增加", "流量提高", "流量调大", "流量调高", "把流量调大", "把流量调高", "流量大一点", "流量高一点")):
-            command.flow_multiplier = 1.2
-        elif any(token in text for token in ("减少流量", "降低流量", "减小流量", "流量减少", "流量降低", "流量调小", "流量调低", "把流量调小", "把流量调低", "流量小一点", "流量低一点")):
-            command.flow_multiplier = 0.8
-        elif any(token in text for token in ("流量稍微大一点", "流量稍大一点", "流量再大一点", "流量再高一点", "流量大一些", "流量高一些", "流量再提高一些", "流量再增加一些")):
-            command.flow_multiplier = 1.1
-        elif any(token in text for token in ("流量稍微小一点", "流量稍小一点", "流量再小一点", "流量再低一点", "流量小一些", "流量低一些", "流量再降低一些", "流量再减少一些")):
-            command.flow_multiplier = 0.9
-        elif any(direction in text for direction in ("南北", "东西")) and any(token in text for token in ("提高一些", "增加一些", "大一点", "高一点")):
-            command.flow_multiplier = 1.1
-        elif any(direction in text for direction in ("南北", "东西")) and any(token in text for token in ("降低一些", "减少一些", "小一点", "低一点")):
-            command.flow_multiplier = 0.9
+        if not has_explicit_flow_target:
+            if increase_match:
+                command.flow_multiplier = 1.0 + float(increase_match.group(1)) / 100.0
+            elif decrease_match:
+                command.flow_multiplier = max(0.0, 1.0 - float(decrease_match.group(1)) / 100.0)
+            elif any(token in text for token in ("增加流量", "提高流量", "加大流量", "流量增加", "流量提高", "流量调大", "流量调高", "把流量调大", "把流量调高", "流量大一点", "流量高一点")):
+                command.flow_multiplier = 1.2
+            elif any(token in text for token in ("减少流量", "降低流量", "减小流量", "流量减少", "流量降低", "流量调小", "流量调低", "把流量调小", "把流量调低", "流量小一点", "流量低一点")):
+                command.flow_multiplier = 0.8
+            elif any(token in text for token in ("流量稍微大一点", "流量稍大一点", "流量再大一点", "流量再高一点", "流量大一些", "流量高一些", "流量再提高一些", "流量再增加一些")):
+                command.flow_multiplier = 1.1
+            elif any(token in text for token in ("流量稍微小一点", "流量稍小一点", "流量再小一点", "流量再低一点", "流量小一些", "流量低一些", "流量再降低一些", "流量再减少一些")):
+                command.flow_multiplier = 0.9
+            elif any(direction in text for direction in ("南北", "东西")) and any(token in text for token in ("提高一些", "增加一些", "大一点", "高一点")):
+                command.flow_multiplier = 1.1
+            elif any(direction in text for direction in ("南北", "东西")) and any(token in text for token in ("降低一些", "减少一些", "小一点", "低一点")):
+                command.flow_multiplier = 0.9
 
         if command.flow_level is None:
             if any(token in text for token in ("高流量", "高峰", "拥堵", "流量大")):
