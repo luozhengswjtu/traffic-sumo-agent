@@ -56,16 +56,21 @@ class SimulationRunner(QObject):
         if self.process_manager.is_running() or self._traci_connection is not None:
             self.stop()
 
+        project_dir = Path(project_dir).resolve()
         sumocfg_path = project_dir / "sumo" / "scenario.sumocfg"
         remote_port = self.process_manager.allocate_free_port()
         try:
+            issues = self.validator.validate_project(project_dir)
+            self._log_validation_warnings(issues)
             self.validator.assert_runnable(project_dir)
             command = self.process_manager.start(sumocfg_path, remote_port=remote_port)
+            self.logProduced.emit(f"准备启动 SUMO：{' '.join(command)}")
             self._connect_traci(remote_port)
         except Exception as exc:
+            error_message = self._build_startup_error_message(project_dir, sumocfg_path, remote_port, exc)
             self.process_manager.stop()
             self._close_traci(wait=False)
-            self._set_error(str(exc))
+            self._set_error(error_message)
             return
 
         self._current_project_dir = project_dir
@@ -230,7 +235,9 @@ class SimulationRunner(QObject):
             self._current_project_dir = None
             return
 
-        error_message = stderr_text.strip() or f"SUMO 异常退出，返回码 {exit_code}"
+        error_message = stderr_text.strip() or stdout_text.strip() or f"SUMO 异常退出，返回码 {exit_code}"
+        if self.process_manager.last_command:
+            error_message = f"{error_message}\n命令: {self.process_manager.last_command_text()}"
         self._set_error(error_message)
         self._close_traci(wait=False)
         self.process_manager.stop()
@@ -257,6 +264,32 @@ class SimulationRunner(QObject):
             delta_t = delta_t / 1000.0
         return max(0.1, delta_t)
 
+    def _log_validation_warnings(self, issues: list) -> None:
+        for issue in issues:
+            if issue.level != "warning":
+                continue
+            location = f" ({issue.file})" if issue.file else ""
+            self.logProduced.emit(f"运行前校验 WARNING: {issue.message}{location}")
+
+    def _build_startup_error_message(self, project_dir: Path, sumocfg_path: Path, remote_port: int, exc: Exception) -> str:
+        parts = [
+            f"启动仿真失败：{exc}",
+            f"项目目录: {project_dir}",
+            f"配置文件: {sumocfg_path}",
+            f"TraCI 端口: {remote_port}",
+        ]
+        if self.process_manager.last_command:
+            parts.append(f"启动命令: {self.process_manager.last_command_text()}")
+        exit_code = self.process_manager.poll_exit_code()
+        if exit_code is not None:
+            parts.append(f"进程退出码: {exit_code}")
+        stdout_text, stderr_text = self.process_manager.read_available_output()
+        if stderr_text.strip():
+            parts.append(f"stderr: {stderr_text.strip()}")
+        elif stdout_text.strip():
+            parts.append(f"stdout: {stdout_text.strip()}")
+        return "\n".join(parts)
+
     def _set_error(self, message: str) -> None:
         self._monitor_timer.stop()
         self._step_timer.stop()
@@ -270,4 +303,3 @@ class SimulationRunner(QObject):
         self.stateChanged.emit(self._state)
         self.logProduced.emit(f"运行错误：{message}")
         self.runFailed.emit(message)
-

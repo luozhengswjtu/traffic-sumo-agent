@@ -5,6 +5,8 @@ import socket
 import subprocess
 from pathlib import Path
 
+from storage.path_utils import normalize_local_path
+
 
 class SumoProcessManager:
     """Manage SUMO process lifecycle using local sumo or sumo-gui executables."""
@@ -18,8 +20,14 @@ class SumoProcessManager:
     def start(self, sumocfg_path: Path, remote_port: int | None = None) -> list[str]:
         if self.is_running():
             raise RuntimeError("SUMO 进程已在运行。")
+        sumocfg_path = normalize_local_path(sumocfg_path)
         if not sumocfg_path.exists():
             raise FileNotFoundError(f"未找到 sumocfg 文件: {sumocfg_path}")
+        if remote_port is not None:
+            if not isinstance(remote_port, int):
+                raise TypeError(f"remote_port 必须是整数，当前值为: {remote_port!r}")
+            if remote_port <= 0:
+                raise ValueError(f"remote_port 必须大于 0，当前值为: {remote_port}")
 
         executable = self._resolve_executable()
         command = [executable, "-c", str(sumocfg_path)]
@@ -33,6 +41,7 @@ class SumoProcessManager:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            cwd=str(sumocfg_path.parent),
         )
         self.last_command = command
         self.last_remote_port = remote_port
@@ -71,6 +80,9 @@ class SumoProcessManager:
 
     def executable_path(self) -> str | None:
         return self._resolve_executable(optional=True)
+
+    def last_command_text(self) -> str:
+        return " ".join(self.last_command)
 
     @staticmethod
     def allocate_free_port() -> int:

@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+from storage.path_utils import normalize_local_path
+
 
 class NetconvertService:
     """Wrap netconvert when available and provide a documented fallback when not."""
@@ -13,8 +15,18 @@ class NetconvertService:
         return shutil.which("netconvert") is not None
 
     def build_net_file(self, project_dir: Path, node_file: Path, edge_file: Path) -> Path:
-        output_path = project_dir / "sumo" / "scenario.net.xml"
+        project_dir = normalize_local_path(project_dir)
+        node_file = normalize_local_path(node_file)
+        edge_file = normalize_local_path(edge_file)
+        if not node_file.exists():
+            raise FileNotFoundError(f"未找到 node 文件: {node_file}")
+        if not edge_file.exists():
+            raise FileNotFoundError(f"未找到 edge 文件: {edge_file}")
+
+        output_path = normalize_local_path(project_dir / "sumo" / "scenario.net.xml")
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path.exists():
+            output_path.unlink()
 
         if self.is_available():
             result = subprocess.run(
@@ -30,9 +42,15 @@ class NetconvertService:
                 capture_output=True,
                 text=True,
                 check=False,
+                cwd=str(output_path.parent),
             )
             if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or "netconvert 执行失败")
+                if output_path.exists():
+                    output_path.unlink()
+                details = result.stderr.strip() or result.stdout.strip() or "netconvert 执行失败"
+                raise RuntimeError(f"netconvert 执行失败: {details}")
+            if not output_path.exists():
+                raise RuntimeError("netconvert 已返回成功，但未生成 scenario.net.xml。")
             return output_path
 
         self._write_placeholder_net(output_path)
