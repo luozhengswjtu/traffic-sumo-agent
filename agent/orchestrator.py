@@ -229,8 +229,6 @@ class AgentOrchestrator:
             if tool_result.get("after_state") is not None:
                 merged.after_state = tool_result["after_state"]
 
-        if command.should_run_simulation:
-            merged.should_run_simulation = True
         merged.reply_text = "\n\n".join(reply_parts) if reply_parts else self._fallback_reply(command, project)
         return merged
     def _tool_generate_scenario(self, arguments: dict) -> dict:
@@ -287,28 +285,30 @@ class AgentOrchestrator:
         updated_context = ProjectContext(meta=meta, network=network, routes=routes, simulation=simulation, scenario_state=next_state)
         build_result = self.project_builder.build_project(updated_context)
         issue_texts = [f"{issue.level}: {issue.message}" for issue in build_result.issues]
+        has_build_errors = any(issue.level == "error" for issue in build_result.issues)
 
         operation_summary = self._build_state_change_summary(base_state if project_context else None, next_state)
         detail_summary = (
-            f"当前场景：{self._label_scenario(next_state.scenario_type)}，"
+            f"当前目标场景：{self._label_scenario(next_state.scenario_type)}，"
             f"车道数={next_state.lane_count}，长度={int(round(next_state.road_length))}m，"
             f"限速={self._format_speed_limit(next_state.speed_limit)}，流量={self._describe_flow(next_state)}，"
             f"时长={next_state.duration_seconds}s，步长={next_state.step_length}。"
         )
         if next_state.traffic_bias:
             detail_summary += f" 偏向={self.BIAS_LABELS.get(next_state.traffic_bias, next_state.traffic_bias)}。"
-        if command.should_run_simulation:
-            detail_summary += " 生成完成后将直接运行仿真。"
+        if command.should_run_simulation and not has_build_errors:
+            detail_summary += " 构建完成后将直接运行仿真。"
         if issue_texts:
             detail_summary += " 注意：" + "；".join(issue_texts)
 
-        reply_text = f"变更确认：\n{operation_summary}\n\n{detail_summary}"
+        reply_prefix = "场景构建失败" if has_build_errors else "变更确认"
+        reply_text = f"{reply_prefix}：\n{operation_summary}\n\n{detail_summary}"
         return {
             "reply_text": reply_text,
             "updated_project": updated_context.model_dump(mode="json"),
             "generated_files": [str(path) for path in build_result.generated_files],
             "issues": issue_texts,
-            "should_run_simulation": command.should_run_simulation,
+            "should_run_simulation": command.should_run_simulation and not has_build_errors,
             "operation_summary": operation_summary,
             "before_state": base_state.model_dump(mode="json") if project_context else None,
             "after_state": next_state.model_dump(mode="json"),

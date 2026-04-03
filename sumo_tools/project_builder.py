@@ -3,17 +3,26 @@
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+from storage.path_utils import normalize_local_path
 from sumo_domain.network_spec import NetworkSpec
 from sumo_domain.project_spec import ProjectContext
 from sumo_domain.route_spec import RouteSpec
 from sumo_domain.simulation_spec import SimulationSpec
 from sumo_tools.config_generator import ConfigGenerator
 from sumo_tools.netconvert_service import NetconvertService
-from sumo_tools.validator import BuildResult, SumoProjectValidator
+from sumo_tools.validator import BuildResult, SumoProjectValidator, ValidationIssue
 
 
 class ProjectBuilder:
     """Persist a ProjectContext into a SUMO-oriented project workspace."""
+
+    OUTPUT_FILENAMES = (
+        "scenario.nod.xml",
+        "scenario.edg.xml",
+        "scenario.rou.xml",
+        "scenario.net.xml",
+        "scenario.sumocfg",
+    )
 
     def __init__(
         self,
@@ -32,24 +41,36 @@ class ProjectBuilder:
         if context.network is None or context.routes is None or context.simulation is None:
             return BuildResult(generated_files=generated_files, issues=issues)
 
-        project_dir = Path(context.meta.project_dir)
-        node_file, edge_file = self.write_network_files(project_dir, context.network)
-        generated_files.extend([node_file, edge_file])
+        project_dir = normalize_local_path(context.meta.project_dir)
+        self._clear_previous_outputs(project_dir)
 
-        route_file = self.write_route_files(project_dir, context.routes)
-        generated_files.append(route_file)
+        try:
+            node_file, edge_file = self.write_network_files(project_dir, context.network)
+            generated_files.extend([node_file, edge_file])
 
-        net_file = self.netconvert_service.build_net_file(project_dir, node_file, edge_file)
-        generated_files.append(net_file)
+            route_file = self.write_route_files(project_dir, context.routes)
+            generated_files.append(route_file)
 
-        config_file = self.write_config_file(project_dir, context.simulation)
-        generated_files.append(config_file)
+            net_file = self.netconvert_service.build_net_file(project_dir, node_file, edge_file)
+            generated_files.append(net_file)
+
+            config_file = self.write_config_file(project_dir, context.simulation)
+            generated_files.append(config_file)
+        except Exception as exc:
+            issues.append(
+                ValidationIssue(
+                    level="error",
+                    message=f"项目构建失败: {exc}",
+                    file=str(project_dir / 'sumo'),
+                )
+            )
+            return BuildResult(generated_files=generated_files, issues=issues)
 
         issues.extend(self.validator.validate_project(project_dir))
         return BuildResult(generated_files=generated_files, issues=issues)
 
     def write_network_files(self, project_dir: Path, network: NetworkSpec) -> tuple[Path, Path]:
-        sumo_dir = project_dir / "sumo"
+        sumo_dir = normalize_local_path(project_dir / "sumo")
         sumo_dir.mkdir(parents=True, exist_ok=True)
 
         node_path = sumo_dir / "scenario.nod.xml"
@@ -84,7 +105,7 @@ class ProjectBuilder:
         return node_path, edge_path
 
     def write_route_files(self, project_dir: Path, routes: RouteSpec) -> Path:
-        sumo_dir = project_dir / "sumo"
+        sumo_dir = normalize_local_path(project_dir / "sumo")
         sumo_dir.mkdir(parents=True, exist_ok=True)
 
         route_path = sumo_dir / "scenario.rou.xml"
@@ -110,10 +131,17 @@ class ProjectBuilder:
         return route_path
 
     def write_config_file(self, project_dir: Path, simulation: SimulationSpec) -> Path:
-        sumo_dir = project_dir / "sumo"
+        sumo_dir = normalize_local_path(project_dir / "sumo")
         sumo_dir.mkdir(parents=True, exist_ok=True)
         config_path = sumo_dir / "scenario.sumocfg"
         return self.config_generator.write_sumocfg(config_path, simulation)
+
+    def _clear_previous_outputs(self, project_dir: Path) -> None:
+        sumo_dir = normalize_local_path(project_dir / "sumo")
+        for filename in self.OUTPUT_FILENAMES:
+            file_path = sumo_dir / filename
+            if file_path.exists():
+                file_path.unlink()
 
     @staticmethod
     def _write_xml(path: Path, root: ET.Element) -> None:

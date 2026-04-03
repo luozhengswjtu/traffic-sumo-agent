@@ -506,3 +506,41 @@
 
 - 若模型已配置，会先尝试模型兜底解析
 - 若仍无结果，会返回明确提示，不再静默按原状态重建
+
+### 2.19 运行前校验与构建失败阻断已补齐
+
+当前已补上的保护包括：
+
+- `SumoProjectValidator` 会解析 `scenario.sumocfg`，检查 `net-file` / `route-files` 引用是否存在
+- `step-length` 会做数值合法性校验
+- 占位 `scenario.net.xml` 现在会被视为不可运行错误，而不是警告
+- `ProjectBuilder` 构建失败时会返回结构化错误，不再把异常直接抛到聊天层
+- `MainWindow._ensure_project_built()` 不再只看 `scenario.sumocfg` 是否存在，而是会先做完整校验
+- 若发现项目目录里只有半成品文件，会先重建，再决定是否允许运行
+- 若加载的是一个残缺旧项目，但当前没有可恢复上下文，则会阻止自动覆盖，要求显式重新生成
+
+### 2.20 仿真启动失败时已补详细诊断
+
+当前 `SimulationRunner.start_project()` 失败时，会补充这些上下文：
+
+- 项目目录
+- `scenario.sumocfg` 路径
+- 分配的 TraCI 端口
+- 实际启动命令
+- 若进程已退出，则附带 `stderr` / `stdout` / 退出码
+
+### 2.21 已确认 netconvert 报错的根因
+
+已实际复现并确认：
+
+- 问题不是 `netconvert` 本身随机失败
+- 根因是项目元数据里的 `project_dir` 被保存成了 `\\?\E:\...` 这种 Windows 扩展路径
+- `netconvert` 在收到这类路径时，会把后续参数错误解析，最终出现：
+  - `Given port number '...scenario.net.xml' is not numeric.`
+
+当前修复包括：
+
+- 新项目创建时不再写入 `\\?\` 前缀路径
+- 读取旧项目时会自动归一化路径
+- `netconvert` / `sumo-gui` 启动前会再次归一化路径，避免旧数据漏网
+- 已对现有 `project.json` 和 `recent_projects.json` 做了一次迁移修复
