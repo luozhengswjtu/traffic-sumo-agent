@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import re
@@ -133,10 +133,12 @@ class AgentOrchestrator:
         self.set_user_preferences = set_user_preferences
         self.memory = SessionMemory()
         self.preference_context_builder = PreferenceContextBuilder()
+        self._last_model_error: str | None = None
         self._register_tools()
 
     def handle_user_message(self, text: str, project: ProjectContext | None) -> AgentExecutionResult:
         self.memory.append_user_message(text)
+        self._last_model_error = None
         command = self._parse_command(text, project)
         tool_calls = self._plan_tools(command, project)
         tool_results = self.execute_tool_plan(tool_calls)
@@ -204,7 +206,10 @@ class AgentOrchestrator:
 
     def _merge_tool_results(self, command: ParsedCommand, project: ProjectContext | None, tool_results: list[dict]) -> AgentExecutionResult:
         if not tool_results:
-            return AgentExecutionResult(reply_text=self._fallback_reply(command, project), updated_project=project)
+            result = AgentExecutionResult(reply_text=self._fallback_reply(command, project), updated_project=project)
+            if self._last_model_error:
+                result.issues.append(f"模型回退失败：{self._last_model_error}")
+            return result
 
         merged = AgentExecutionResult(reply_text="", updated_project=project)
         reply_parts: list[str] = []
@@ -233,6 +238,7 @@ class AgentOrchestrator:
             merged.should_run_simulation = True
         merged.reply_text = "\n\n".join(reply_parts) if reply_parts else self._fallback_reply(command, project)
         return merged
+
     def _tool_generate_scenario(self, arguments: dict) -> dict:
         command = ParsedCommand.model_validate(arguments["command"])
         project_context = ProjectContext.model_validate(arguments["project"]) if arguments.get("project") else None
@@ -489,12 +495,22 @@ class AgentOrchestrator:
             )
             payload = self._extract_json_object(response.text)
             if payload is None:
+                self._last_model_error = "模型已响应，但返回内容里没有可解析的 JSON。"
                 return None
+            intent_value = payload.get("intent")
+            if not isinstance(intent_value, str) or intent_value not in {item.value for item in UserIntent}:
+                payload["intent"] = UserIntent.UNKNOWN.value
+            if payload.get("should_run_simulation") is None:
+                payload["should_run_simulation"] = False
+            if not isinstance(payload.get("preference_updates"), dict):
+                payload["preference_updates"] = {}
             parsed = ParsedCommand.model_validate(payload)
             if parsed.intent == UserIntent.UNKNOWN:
                 parsed.intent = self.detect_intent(text)
+            self._last_model_error = None
             return parsed
-        except Exception:
+        except Exception as exc:
+            self._last_model_error = self._format_model_error(str(exc) or exc.__class__.__name__)
             return None
 
     def _parse_with_rules(self, text: str) -> ParsedCommand:
@@ -712,17 +728,27 @@ class AgentOrchestrator:
     def _fallback_reply(self, command: ParsedCommand, project: ProjectContext | None) -> str:
         if command.intent == UserIntent.RUN_SIMULATION:
             if project is None:
-                return "当前没有项目上下文。请先生成场景，或先新建项目后再运行。"
-            return "已识别为运行请求。"
+                return "\u5f53\u524d\u6ca1\u6709\u9879\u76ee\u4e0a\u4e0b\u6587\u3002\u8bf7\u5148\u751f\u6210\u573a\u666f\uff0c\u6216\u5148\u65b0\u5efa\u9879\u76ee\u540e\u518d\u8fd0\u884c\u3002"
+            return "\u5df2\u8bc6\u522b\u4e3a\u8fd0\u884c\u8bf7\u6c42\u3002"
         if command.intent == UserIntent.SUMMARIZE_PROJECT:
             if project is None:
-                return "当前没有项目上下文。请先生成场景或创建项目。"
+                return "\u5f53\u524d\u6ca1\u6709\u9879\u76ee\u4e0a\u4e0b\u6587\u3002\u8bf7\u5148\u751f\u6210\u573a\u666f\u6216\u521b\u5efa\u9879\u76ee\u3002"
             return self._format_project_summary(project, self._derive_scenario_state(project, self.get_user_preferences()))
         if command.intent == UserIntent.VIEW_HISTORY:
-            return "当前没有可展示的历史记录。"
+            return "\u5f53\u524d\u6ca1\u6709\u53ef\u5c55\u793a\u7684\u5386\u53f2\u8bb0\u5f55\u3002"
         if command.intent == UserIntent.UNKNOWN:
-            return "未识别出明确操作。当前支持：生成场景、修改车道/流量/步长/时长/限速/长度、查询当前项目摘要、查看最近操作历史、更新默认偏好、运行仿真。"
-        return "请求已处理。"
+            message = "\u672a\u8bc6\u522b\u51fa\u660e\u786e\u64cd\u4f5c\u3002TrafficAgent \u5f53\u524d\u662f\u547d\u4ee4\u5f0f\u4ee3\u7406\uff0c\u4e0d\u652f\u6301\u95f2\u804a\u3001\u81ea\u6211\u4ecb\u7ecd\u6216\u5f00\u653e\u5f0f\u95ee\u7b54\u3002\u5f53\u524d\u652f\u6301\uff1a\u751f\u6210\u573a\u666f\u3001\u4fee\u6539\u8f66\u9053/\u6d41\u91cf/\u6b65\u957f/\u65f6\u957f/\u9650\u901f/\u957f\u5ea6\u3001\u67e5\u8be2\u5f53\u524d\u9879\u76ee\u6458\u8981\u3001\u67e5\u770b\u6700\u8fd1\u64cd\u4f5c\u5386\u53f2\u3001\u66f4\u65b0\u9ed8\u8ba4\u504f\u597d\u3001\u8fd0\u884c\u4eff\u771f\u3002"
+            if self._last_model_error:
+                return f"{message}\n\n\u6a21\u578b\u56de\u9000\u5931\u8d25\uff1a{self._last_model_error}"
+            return message
+        return "\u8bf7\u6c42\u5df2\u5904\u7406\u3002"
+
+    @staticmethod
+    def _format_model_error(message: str) -> str:
+        compact = " ".join(message.split())
+        if len(compact) <= 240:
+            return compact
+        return f"{compact[:237]}..."
 
     def _infer_flow_level(self, flow_rate: int) -> str:
         if flow_rate < 450:
