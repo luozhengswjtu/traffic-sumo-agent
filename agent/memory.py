@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from model_providers.base import ChatMessage
 from sumo_domain.preferences import UserPreferences
-from sumo_domain.project_spec import ProjectContext
+from sumo_domain.project_spec import DirectionalLaneConfig, ProjectContext
 
 
 class SessionMemory:
@@ -28,9 +28,7 @@ class SessionMemory:
         if not recent:
             return ""
         role_map = {"user": "用户", "assistant": "通通", "system": "系统"}
-        return " | ".join(
-            f"{role_map.get(message.role, message.role)}: {message.content}" for message in recent
-        )
+        return " | ".join(f"{role_map.get(message.role, message.role)}: {message.text_content()}" for message in recent)
 
     def last_tool_summary(self) -> str | None:
         if not self._tool_summaries:
@@ -53,8 +51,23 @@ class PreferenceContextBuilder:
         if state is None:
             return f"当前项目 {project.meta.name} 已打开，但还没有完整的场景状态。"
 
+        lane_summary = _format_lane_summary(state.scenario_type, state.lane_count, state.directional_lanes)
         return (
-            f"当前项目 {project.meta.name}：场景={state.scenario_type}，车道数={state.lane_count}，"
+            f"当前项目 {project.meta.name}：场景={state.scenario_type}，{lane_summary}，"
             f"道路长度={int(round(state.road_length))}m，限速={state.speed_limit * 3.6:.1f} km/h，"
             f"流量={state.flow_rate or state.flow_level}，时长={state.duration_seconds}s，步长={state.step_length}。"
         )
+
+
+def _format_lane_summary(scenario_type: str, lane_count: int, directional_lanes: DirectionalLaneConfig) -> str:
+    if not directional_lanes.has_any():
+        return f"车道数={lane_count}"
+    merged = directional_lanes.merged_with_fallback(scenario_type, lane_count)
+    parts = [
+        f"{DirectionalLaneConfig.edge_label(edge_id)}{value}"
+        for edge_id, value in merged.values_for_topology(scenario_type).items()
+        if value is not None
+    ]
+    if not parts:
+        return f"车道数={lane_count}"
+    return "方向车道=" + "/".join(parts)

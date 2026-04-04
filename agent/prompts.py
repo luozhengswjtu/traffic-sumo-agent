@@ -1,121 +1,70 @@
 from __future__ import annotations
 
+import json
+
 from sumo_domain.preferences import UserPreferences
 
-ASSISTANT_NAME = "通通"
+ASSISTANT_NAME = "\u901a\u901a"
 NEWLINE = chr(10)
 DOUBLE_NEWLINE = NEWLINE * 2
 
 
 def _preferences_suffix(preferences: UserPreferences) -> str:
-    extra = preferences.system_prompt_additions or "无"
-    return (
-        f"默认场景={preferences.default_scenario_type}，"
-        f"默认流量={preferences.default_flow_level}，"
-        f"默认时长={preferences.default_duration}，"
-        f"额外偏好={extra}。"
-    )
+    extra = preferences.system_prompt_additions or "\u65e0"
+    return f"\u9ed8\u8ba4\u573a\u666f={preferences.default_scenario_type}\uff0c\u9ed8\u8ba4\u6d41\u91cf={preferences.default_flow_level}\uff0c\u9ed8\u8ba4\u65f6\u957f={preferences.default_duration}\uff0c\u989d\u5916\u504f\u597d={extra}\u3002"
 
 
 def build_assistant_system_prompt(preferences: UserPreferences) -> str:
-    return (
-        f"你是 TrafficAgent 桌面应用的中文代理 {ASSISTANT_NAME}。"
-        "你的工作范围限定为 TrafficAgent 产品能力、当前项目上下文、SUMO 和交通仿真相关说明。"
-        "普通问答直接用自然语言回答；可执行的工程或仿真需求要优先调用工具。"
-        "如果问题超出这个范围，要明确说明你主要支持本产品和当前项目，不要冒充通用百科助手。"
-        "当用户的意图是查看介绍、能力、当前项目、操作建议等非执行问题时，不要强行调工具。"
-        "当用户要生成场景、修改参数、查看历史、查看项目摘要、更新偏好或运行仿真时，应当调用提供的 tool schema。"
-        "回答要简洁、工程化、对用户友好。"
-        f" {_preferences_suffix(preferences)}"
-    )
+    return f"\u4f60\u662f TrafficAgent \u684c\u9762\u5e94\u7528\u4e2d\u7684\u4e2d\u6587\u9879\u76ee\u52a9\u624b {ASSISTANT_NAME}\u3002\u4f60\u7684\u8303\u56f4\u9650\u5b9a\u4e3a TrafficAgent \u4ea7\u54c1\u80fd\u529b\u3001\u5f53\u524d\u9879\u76ee\u4e0a\u4e0b\u6587\u3001SUMO \u548c\u4ea4\u901a\u4eff\u771f\u76f8\u5173\u8bf4\u660e\u3002\u666e\u901a\u804a\u5929\u76f4\u63a5\u81ea\u7136\u56de\u7b54\uff1b\u5de5\u7a0b\u6216\u4eff\u771f\u8bf7\u6c42\u4f18\u5148\u89c4\u5212\u5de5\u5177\u8c03\u7528\u3002\u7528\u6237\u4e0a\u4f20\u56fe\u7247\u65f6\uff0c\u4f60\u9700\u8981\u5224\u65ad\u662f\u5426\u4e3a\u4fde\u89c6\u8def\u53e3\u793a\u610f\u56fe\uff0c\u5e76\u63d0\u53d6\u53ef\u751f\u6210 SUMO \u8def\u53e3\u6240\u9700\u7684\u7ed3\u6784\u5316\u4fe1\u606f\u3002{_preferences_suffix(preferences)}"
 
 
-def build_context_system_prompt(
-    project_summary: str | None,
-    recent_dialogue: str | None,
-    last_tool_summary: str | None,
-) -> str:
-    project_line = project_summary or "当前没有项目上下文。"
-    dialogue_line = recent_dialogue or "当前会话还没有更早的对话。"
-    tool_line = last_tool_summary or "本会话还没有工具执行记录。"
-    return NEWLINE.join(
-        [
-            "这是当前会话的额外上下文。",
-            f"项目摘要：{project_line}",
-            f"最近对话：{dialogue_line}",
-            f"最近工具结果：{tool_line}",
-        ]
-    )
+def build_context_system_prompt(project_summary: str | None, recent_dialogue: str | None, last_tool_summary: str | None) -> str:
+    project_text = project_summary or "\u5f53\u524d\u6ca1\u6709\u9879\u76ee\u4e0a\u4e0b\u6587\u3002"
+    dialogue_text = recent_dialogue or "\u5f53\u524d\u4f1a\u8bdd\u8fd8\u6ca1\u6709\u66f4\u65e9\u7684\u5bf9\u8bdd\u3002"
+    tool_text = last_tool_summary or "\u672c\u4f1a\u8bdd\u8fd8\u6ca1\u6709\u5de5\u5177\u6267\u884c\u8bb0\u5f55\u3002"
+    return NEWLINE.join(["\u8fd9\u662f\u5f53\u524d\u4f1a\u8bdd\u7684\u4e0a\u4e0b\u6587\u3002", f"\u9879\u76ee\u6458\u8981\uff1a{project_text}", f"\u6700\u8fd1\u5bf9\u8bdd\uff1a{dialogue_text}", f"\u6700\u8fd1\u5de5\u5177\u7ed3\u679c\uff1a{tool_text}"])
 
 
 def build_result_system_prompt(preferences: UserPreferences) -> str:
-    return (
-        f"你是 {ASSISTANT_NAME}，需要根据工具执行结果给用户写最终说明。"
-        "用自然中文总结，要交代你理解了什么、执行了哪些动作、当前项目发生了什么变化、还有哪些问题或下一步建议。"
-        "不要输出 JSON，不要原封不动复读 tool arguments，要用用户看得懂的方式说明。"
-        f" {_preferences_suffix(preferences)}"
-    )
+    return f"\u4f60\u662f {ASSISTANT_NAME}\uff0c\u9700\u8981\u6839\u636e\u5de5\u5177\u6267\u884c\u7ed3\u679c\u751f\u6210\u6700\u7ec8\u56de\u590d\u3002\u8bf7\u7528\u81ea\u7136\u4e2d\u6587\u603b\u7ed3\uff1a\u7406\u89e3\u4e86\u4ec0\u4e48\u3001\u6267\u884c\u4e86\u54ea\u4e9b\u52a8\u4f5c\u3001\u5f53\u524d\u9879\u76ee\u53d8\u6210\u4e86\u4ec0\u4e48\u3001\u8fd8\u9700\u8981\u7528\u6237\u6ce8\u610f\u4ec0\u4e48\u3002{_preferences_suffix(preferences)}"
 
 
-def build_result_user_prompt(
-    user_text: str,
-    project_summary: str | None,
-    tool_summaries: list[str],
-    issues: list[str],
-) -> str:
-    project_line = project_summary or "当前没有项目上下文。"
-    tool_block = [f"- {item}" for item in tool_summaries] or ["- 本轮没有工具执行结果。"]
-    issue_block = [f"- {item}" for item in issues] or ["- 无"]
-    return NEWLINE.join(
-        [
-            f"用户原话：{user_text}",
-            f"当前项目：{project_line}",
-            "工具执行摘要：",
-            *tool_block,
-            "已知问题：",
-            *issue_block,
-        ]
-    )
+def build_result_user_prompt(user_text: str, project_summary: str | None, tool_summaries: list[str], issues: list[str]) -> str:
+    project_text = project_summary or "\u5f53\u524d\u6ca1\u6709\u9879\u76ee\u4e0a\u4e0b\u6587\u3002"
+    tool_block = [f"- {item}" for item in tool_summaries] or ["- \u672c\u8f6e\u6ca1\u6709\u5de5\u5177\u6267\u884c\u7ed3\u679c\u3002"]
+    issue_block = [f"- {item}" for item in issues] or ["- \u65e0"]
+    return NEWLINE.join([f"\u7528\u6237\u539f\u8bdd\uff1a{user_text}", f"\u5f53\u524d\u9879\u76ee\uff1a{project_text}", "\u5de5\u5177\u6267\u884c\u6458\u8981\uff1a", *tool_block, "\u5df2\u77e5\u95ee\u9898\uff1a", *issue_block])
 
 
 def build_intro_reply(project_summary: str | None) -> str:
-    project_line = project_summary or "当前还没有打开项目。"
-    return DOUBLE_NEWLINE.join(
-        [
-            (
-                f"我是 {ASSISTANT_NAME}，负责 TrafficAgent 里的交通仿真协作。"
-                "我可以帮你生成 SUMO 场景、修改车道、流量、时长、步长等参数，也可以查看当前项目摘要、操作历史，并在场景就绪后发起仿真。"
-                "如果你直接说需求，我会先理解你的意图，再选择是直接回答还是调用工具。"
-            ),
-            f"当前你的项目上下文：{project_line}",
-        ]
-    )
+    project_text = project_summary or "\u5f53\u524d\u8fd8\u6ca1\u6709\u6253\u5f00\u9879\u76ee\u3002"
+    return DOUBLE_NEWLINE.join([f"\u6211\u662f {ASSISTANT_NAME}\uff0c\u8d1f\u8d23 TrafficAgent \u91cc\u7684\u573a\u666f\u751f\u6210\u3001\u53c2\u6570\u8c03\u6574\u3001\u5386\u53f2\u67e5\u8be2\u3001\u4eff\u771f\u8fd0\u884c\u548c\u8def\u53e3\u56fe\u7247\u89e3\u6790\u3002\u666e\u901a\u95ee\u9898\u6211\u4f1a\u76f4\u63a5\u56de\u7b54\uff1b\u9047\u5230\u53ef\u6267\u884c\u8bf7\u6c42\uff0c\u6211\u4f1a\u89c4\u5212\u5de5\u5177\u5e76\u628a\u7ed3\u679c\u6574\u7406\u7ed9\u4f60\u3002", f"\u5f53\u524d\u9879\u76ee\u4e0a\u4e0b\u6587\uff1a{project_text}"])
 
 
 def build_capability_reply(project_summary: str | None) -> str:
-    project_line = project_summary or "当前还没有打开项目。"
-    return NEWLINE.join(
-        [
-            f"{ASSISTANT_NAME} 主要做三类事情。",
-            "1. 用自然语言解释 TrafficAgent 能做什么，并结合当前项目回答你的问题。",
-            "2. 把你的工程指令转成可执行的工具调用，比如生成十字路口、调整流量、查看历史、运行仿真。",
-            "3. 在执行完成后，把变更和结果整理成人话告诉你。",
-            "",
-            f"当前你的项目上下文：{project_line}",
-        ]
-    )
+    project_text = project_summary or "\u5f53\u524d\u8fd8\u6ca1\u6709\u6253\u5f00\u9879\u76ee\u3002"
+    return NEWLINE.join([f"{ASSISTANT_NAME} \u4e3b\u8981\u652f\u6301\u56db\u7c7b\u5de5\u4f5c\uff1a", "1. \u89e3\u91ca\u5f53\u524d\u4ea7\u54c1\u80fd\u529b\u548c\u9879\u76ee\u72b6\u6001\u3002", "2. \u628a\u81ea\u7136\u8bed\u8a00\u8f6c\u6210\u573a\u666f\u751f\u6210\u3001\u53c2\u6570\u4fee\u6539\u3001\u5386\u53f2\u67e5\u8be2\u548c\u8fd0\u884c\u4eff\u771f\u7684\u5de5\u5177\u8c03\u7528\u3002", "3. \u89e3\u6790\u4f60\u4e0a\u4f20\u7684\u8def\u53e3\u56fe\u7247\uff0c\u63d0\u53d6\u5404\u65b9\u5411\u8fdb\u51fa\u53e3\u8f66\u9053\u3001\u957f\u5ea6\u548c\u9650\u901f\u3002", "4. \u5728\u6267\u884c\u7ed3\u675f\u540e\uff0c\u628a\u7ed3\u679c\u6574\u7406\u6210\u7528\u6237\u53ef\u8bfb\u7684\u8bf4\u660e\u3002", "", f"\u5f53\u524d\u9879\u76ee\u4e0a\u4e0b\u6587\uff1a{project_text}"])
 
 
 def build_how_to_reply(project_summary: str | None) -> str:
-    project_line = project_summary or "当前还没有打开项目。"
-    return NEWLINE.join(
-        [
-            "你可以直接用接近口语的方式提需求。",
-            "- 生成场景：生成一个双向四车道十字路口，仿真 1800 秒。",
-            "- 调整参数：把流量提高 30% 并运行。",
-            "- 查看信息：当前项目是什么？ 或 看看最近 5 条历史。",
-            "- 更新偏好：以后默认场景用十字路口，默认时长 1200 秒。",
-            "",
-            f"当前你的项目上下文：{project_line}",
-        ]
-    )
+    project_text = project_summary or "\u5f53\u524d\u8fd8\u6ca1\u6709\u6253\u5f00\u9879\u76ee\u3002"
+    return NEWLINE.join(["\u4f60\u53ef\u4ee5\u76f4\u63a5\u7528\u81ea\u7136\u8bed\u8a00\u63cf\u8ff0\u9700\u6c42\uff0c\u4f8b\u5982\uff1a", "- \u751f\u6210\u4e00\u4e2a\u53cc\u5411\u56db\u8f66\u9053\u5341\u5b57\u8def\u53e3\uff0c\u4eff\u771f 1800 \u79d2", "- \u628a\u6d41\u91cf\u63d0\u9ad8 30% \u5e76\u8fd0\u884c", "- \u5f53\u524d\u9879\u76ee\u662f\u4ec0\u4e48", "- \u770b\u770b\u6700\u8fd1 5 \u6761\u5386\u53f2", "- \u4e0a\u4f20\u4e00\u5f20\u8def\u53e3\u4fde\u89c6\u56fe\uff0c\u5e2e\u6211\u8bc6\u522b\u6210 SUMO \u8def\u53e3", "", f"\u5f53\u524d\u9879\u76ee\u4e0a\u4e0b\u6587\uff1a{project_text}"])
+
+
+def build_image_analysis_system_prompt(preferences: UserPreferences) -> str:
+    example = {"is_intersection": True, "topology": "intersection", "is_supported_for_generation": True, "directional_lanes": {"north_in": 2, "north_out": 2, "south_in": 2, "south_out": 2, "west_in": 3, "west_out": 3, "east_in": 3, "east_out": 3}, "road_length_m": 220, "speed_limit_kmh": 50, "confidence": 0.86, "reason": "\u8fd9\u662f\u4e00\u4e2a\u4fde\u89c6\u5341\u5b57\u8def\u53e3\u793a\u610f\u56fe\uff0c\u62d3\u6251\u6e05\u6670\u3002"}
+    return f"\u4f60\u662f {ASSISTANT_NAME}\uff0c\u8d1f\u8d23\u89e3\u6790\u7528\u6237\u4e0a\u4f20\u7684\u8def\u53e3\u56fe\u7247\u3002\u53ea\u652f\u6301\u4fde\u89c6\u793a\u610f\u56fe\u3001\u624b\u7ed8\u56fe\u3001\u62d3\u6251\u6e05\u6670\u7684\u5730\u56fe\u622a\u56fe\u3002\u5982\u679c\u4e0d\u662f\u8def\u53e3\u56fe\u3001\u4e0d\u662f\u4fde\u89c6\u89c6\u89d2\u3001\u6216\u65e0\u6cd5\u5224\u65ad\uff0c\u5fc5\u987b\u8fd4\u56de is_intersection=false\u3002\u5f53\u524d\u53ef\u751f\u6210\u7684 SUMO \u6a21\u677f\u53ea\u6709 intersection\u3001t_junction\u3001corridor \u4e09\u7c7b\u3002\u4f60\u5fc5\u987b\u53ea\u8f93\u51fa\u4e00\u4e2a JSON \u5bf9\u8c61\uff0c\u4e0d\u8981 markdown\uff0c\u4e0d\u8981\u89e3\u91ca\u3002\u5b57\u6bb5\u793a\u4f8b\uff1a{json.dumps(example, ensure_ascii=False)}{_preferences_suffix(preferences)}"
+
+
+def build_image_analysis_user_prompt(project_summary: str | None) -> str:
+    project_text = project_summary or "\u5f53\u524d\u6ca1\u6709\u9879\u76ee\u4e0a\u4e0b\u6587\u3002"
+    return NEWLINE.join(["\u8bf7\u5224\u65ad\u8fd9\u5f20\u56fe\u7247\u662f\u5426\u4e3a\u53ef\u89e3\u6790\u7684\u8def\u53e3\u4fde\u89c6\u56fe\u3002", "\u5982\u679c\u662f\uff0c\u8bf7\u63d0\u53d6\u8def\u53e3\u7c7b\u578b\u3001\u5404\u65b9\u5411\u8fdb\u51fa\u53e3\u8f66\u9053\u6570\u3001\u9053\u8def\u957f\u5ea6\u548c\u9650\u901f\u3002", "\u5982\u679c\u4e0d\u662f\uff0c\u8bf7\u5728 reason \u91cc\u7ed9\u51fa\u7b80\u77ed\u539f\u56e0\u3002", f"\u5f53\u524d\u9879\u76ee\u4e0a\u4e0b\u6587\uff1a{project_text}"])
+
+
+def build_image_patch_system_prompt(preferences: UserPreferences) -> str:
+    example = {"topology": "intersection", "road_length_m": 240, "speed_limit_kmh": 50, "directional_lanes": {"north_in": 3}}
+    return f"\u4f60\u662f {ASSISTANT_NAME}\uff0c\u9700\u8981\u6839\u636e\u7528\u6237\u6587\u672c\u4fee\u6539\u8def\u53e3\u8349\u7a3f\u3002\u53ea\u5141\u8bb8\u4fee\u6539 topology\u3001road_length_m\u3001speed_limit_kmh \u548c directional_lanes \u4e2d\u7684\u516b\u4e2a\u65b9\u5411\u8f66\u9053\u5b57\u6bb5\u3002\u53ea\u8f93\u51fa JSON patch \u5bf9\u8c61\uff0c\u53ea\u5305\u542b\u53d8\u5316\u5b57\u6bb5\uff0c\u4e0d\u8981 markdown\uff0c\u4e0d\u8981\u89e3\u91ca\u3002\u793a\u4f8b\uff1a{json.dumps(example, ensure_ascii=False)}{_preferences_suffix(preferences)}"
+
+
+def build_image_patch_user_prompt(user_text: str, current_draft_json: str) -> str:
+    return NEWLINE.join([f"\u7528\u6237\u539f\u8bdd\uff1a{user_text}", "\u5f53\u524d\u8349\u7a3f JSON\uff1a", current_draft_json])

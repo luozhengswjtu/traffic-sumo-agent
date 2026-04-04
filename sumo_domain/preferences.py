@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pydantic import BaseModel
 
@@ -15,6 +15,7 @@ class ModelConfig(BaseModel):
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-4.1-mini"
+    supports_vision: bool = False
     temperature: float = 0.2
     timeout_seconds: int = 60
 

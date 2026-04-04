@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from urllib import request
@@ -18,7 +18,7 @@ class OpenAICompatibleClient(BaseModelClient):
 
         payload: dict = {
             "model": self.config.model,
-            "messages": [message.model_dump() for message in messages],
+            "messages": [self._serialize_message(message) for message in messages],
             "temperature": self.config.temperature,
         }
         if tools:
@@ -48,11 +48,27 @@ class OpenAICompatibleClient(BaseModelClient):
         tool_calls = [
             ToolCall(
                 name=tool_call["function"]["name"],
-                arguments=json.loads(tool_call["function"].get("arguments", "{}") or "{}"),
+                arguments=self._parse_tool_arguments(tool_call["function"].get("arguments", "{}")),
             )
             for tool_call in message.get("tool_calls", [])
         ]
         return ModelResponse(text=content, tool_calls=tool_calls)
+
+    @staticmethod
+    def _serialize_message(message: ChatMessage) -> dict:
+        if isinstance(message.content, str):
+            content: str | list[dict] = message.content
+        else:
+            content = [part.to_payload() for part in message.content]
+        return {"role": message.role, "content": content}
+
+    @staticmethod
+    def _parse_tool_arguments(raw: str) -> dict:
+        try:
+            parsed = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     @staticmethod
     def _extract_content(content) -> str:
@@ -62,7 +78,7 @@ class OpenAICompatibleClient(BaseModelClient):
             parts: list[str] = []
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(item.get("text", ""))
+                    parts.append(str(item.get("text", "")))
             return "\n".join(part for part in parts if part)
         return ""
 

@@ -1,128 +1,55 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QPushButton,
-    QScrollArea,
-    QSizePolicy,
-    QVBoxLayout,
-    QWidget,
-)
+from pathlib import Path
 
-ASSISTANT_NAME = "通通"
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+
+from agent.image_models import ImageAnalysisResult
+from sumo_domain.project_spec import DirectionalLaneConfig
+
+ASSISTANT_NAME = "\u901a\u901a"
 
 
 class MessageBubble(QFrame):
-    ROLE_TITLES = {
-        "user": "You",
-        "assistant": ASSISTANT_NAME,
-        "agent": ASSISTANT_NAME,
-        "status": ASSISTANT_NAME,
-    }
+    ROLE_TITLES = {"user": "You", "assistant": ASSISTANT_NAME, "agent": ASSISTANT_NAME, "status": ASSISTANT_NAME}
 
     def __init__(self, role: str, text: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.role = role
         self.raw_text = text
-        self.role_label: QLabel | None = None
-        self.content_label: QLabel | None = None
-        self._build_ui(text)
-
-    def _build_ui(self, text: str) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(6)
-
-        self.role_label = QLabel(self.ROLE_TITLES.get(self.role, ASSISTANT_NAME))
+        self.role_label = QLabel(self.ROLE_TITLES.get(role, ASSISTANT_NAME))
         self.role_label.setObjectName("messageRole")
-
         self.content_label = QLabel(text)
         self.content_label.setObjectName("messageContent")
         self.content_label.setWordWrap(True)
-        self.content_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.content_label.setTextFormat(Qt.PlainText)
         self.content_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
         layout.addWidget(self.role_label)
         layout.addWidget(self.content_label)
-
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        self.setObjectName(f"messageBubble{self.role.title()}")
+        self.setObjectName(f"messageBubble{role.title()}")
         self.setStyleSheet(self._style_sheet())
 
     def set_text(self, text: str) -> None:
         self.raw_text = text
-        if self.content_label is not None:
-            self.content_label.setText(text)
+        self.content_label.setText(text)
 
     def apply_width(self, max_width: int) -> None:
-        max_width = max(300, max_width)
-        min_width = 0
-        if len(self.raw_text) >= 14:
-            min_width = min(max_width, max(240, int(max_width * 0.42)))
+        max_width = max(320, max_width)
         self.setMaximumWidth(max_width)
-        self.setMinimumWidth(min_width)
-        if self.content_label is not None:
-            self.content_label.setMaximumWidth(max_width - 32)
+        self.content_label.setMaximumWidth(max_width - 32)
 
     def _style_sheet(self) -> str:
         if self.role == "user":
-            return """
-                QFrame#messageBubbleUser {
-                    background: #E9F1FF;
-                    border: 1px solid #D5E3FF;
-                    border-radius: 18px;
-                }
-                QLabel#messageRole {
-                    color: #5B6B86;
-                    font-size: 11px;
-                    font-weight: 700;
-                }
-                QLabel#messageContent {
-                    color: #10233D;
-                    font-size: 13px;
-                    line-height: 1.45;
-                }
-            """
+            return """QFrame#messageBubbleUser { background: #E9F1FF; border: 1px solid #D5E3FF; border-radius: 18px; } QLabel#messageRole { color: #5B6B86; font-size: 11px; font-weight: 700; } QLabel#messageContent { color: #10233D; font-size: 13px; line-height: 1.45; }"""
         if self.role == "status":
-            return """
-                QFrame#messageBubbleStatus {
-                    background: #F6F8FC;
-                    border: 1px solid #E4EAF4;
-                    border-radius: 18px;
-                }
-                QLabel#messageRole {
-                    color: #64748B;
-                    font-size: 11px;
-                    font-weight: 700;
-                }
-                QLabel#messageContent {
-                    color: #475569;
-                    font-size: 13px;
-                }
-            """
-        return """
-            QFrame#messageBubbleAssistant,
-            QFrame#messageBubbleAgent {
-                background: #FFFFFF;
-                border: 1px solid #E6EBF2;
-                border-radius: 18px;
-            }
-            QLabel#messageRole {
-                color: #5F6B7A;
-                font-size: 11px;
-                font-weight: 700;
-            }
-            QLabel#messageContent {
-                color: #0F172A;
-                font-size: 13px;
-                line-height: 1.48;
-            }
-        """
+            return """QFrame#messageBubbleStatus { background: #F6F8FC; border: 1px solid #E4EAF4; border-radius: 18px; } QLabel#messageRole { color: #64748B; font-size: 11px; font-weight: 700; } QLabel#messageContent { color: #475569; font-size: 13px; }"""
+        return """QFrame#messageBubbleAssistant, QFrame#messageBubbleAgent { background: #FFFFFF; border: 1px solid #E6EBF2; border-radius: 18px; } QLabel#messageRole { color: #5F6B7A; font-size: 11px; font-weight: 700; } QLabel#messageContent { color: #0F172A; font-size: 13px; line-height: 1.48; }"""
 
 
 class WelcomeCard(QFrame):
@@ -132,119 +59,157 @@ class WelcomeCard(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(10)
-
         eyebrow = QLabel("TRAFFIC AGENT")
         eyebrow.setObjectName("welcomeEyebrow")
         title = QLabel(ASSISTANT_NAME)
         title.setObjectName("welcomeTitle")
-        description = QLabel(
-            "面向 TrafficAgent 的项目助手。普通问题我会直接回答，"
-            "工程类请求我会规划工具并把结果整理给你。"
-        )
+        description = QLabel("\u9762\u5411 TrafficAgent \u7684\u9879\u76ee\u52a9\u624b\u3002\u666e\u901a\u95ee\u9898\u6211\u4f1a\u76f4\u63a5\u56de\u7b54\uff0c\u5de5\u7a0b\u8bf7\u6c42\u6211\u4f1a\u89c4\u5212\u5de5\u5177\u5e76\u628a\u7ed3\u679c\u6574\u7406\u7ed9\u4f60\u3002")
         description.setObjectName("welcomeDescription")
         description.setWordWrap(True)
-
-        examples = QLabel(
-            chr(10).join(
-                [
-                    "试试这些说法：",
-                    "- 介绍你自己",
-                    "- 当前项目是什么",
-                    "- 生成一个双向四车道十字路口，仿真 1800 秒",
-                    "- 把流量提高 30% 并运行",
-                ]
-            )
-        )
+        examples = QLabel("\u5c1d\u8bd5\u8fd9\u4e9b\u8bf4\u6cd5\uff1a\n- \u4ecb\u7ecd\u4f60\u81ea\u5df1\n- \u5f53\u524d\u9879\u76ee\u662f\u4ec0\u4e48\n- \u751f\u6210\u4e00\u4e2a\u53cc\u5411\u56db\u8f66\u9053\u5341\u5b57\u8def\u53e3\uff0c\u4eff\u771f 1800 \u79d2\n- \u628a\u6d41\u91cf\u63d0\u9ad8 30% \u5e76\u8fd0\u884c\n- \u4e0a\u4f20\u4e00\u5f20\u8def\u53e3\u4fde\u89c6\u56fe\uff0c\u5e2e\u6211\u8bc6\u522b\u6210 SUMO \u8def\u53e3")
         examples.setObjectName("welcomeExamples")
         examples.setWordWrap(True)
-
         layout.addWidget(eyebrow)
         layout.addWidget(title)
         layout.addWidget(description)
         layout.addWidget(examples)
+        self.setStyleSheet("""QFrame#chatWelcome { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #F8FBFF, stop:1 #EEF4FF); border: 1px solid #DDE7F5; border-radius: 20px; } QLabel#welcomeEyebrow { color: #64748B; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; } QLabel#welcomeTitle { color: #0F172A; font-size: 24px; font-weight: 700; } QLabel#welcomeDescription { color: #334155; font-size: 13px; } QLabel#welcomeExamples { color: #475569; font-size: 12px; background: rgba(255, 255, 255, 0.72); border: 1px solid #E3EAF5; border-radius: 14px; padding: 12px 14px; }""")
 
-        self.setStyleSheet(
-            """
-            QFrame#chatWelcome {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #F8FBFF, stop:1 #EEF4FF);
-                border: 1px solid #DDE7F5;
-                border-radius: 20px;
-            }
-            QLabel#welcomeEyebrow {
-                color: #64748B;
-                font-size: 11px;
-                font-weight: 700;
-                letter-spacing: 0.08em;
-            }
-            QLabel#welcomeTitle {
-                color: #0F172A;
-                font-size: 24px;
-                font-weight: 700;
-            }
-            QLabel#welcomeDescription {
-                color: #334155;
-                font-size: 13px;
-            }
-            QLabel#welcomeExamples {
-                color: #475569;
-                font-size: 12px;
-                line-height: 1.5;
-                background: rgba(255, 255, 255, 0.72);
-                border: 1px solid #E3EAF5;
-                border-radius: 14px;
-                padding: 12px 14px;
-            }
-            """
-        )
+
+class ImageBubble(QFrame):
+    def __init__(self, image_path: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("imageBubble")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+        title = QLabel("\u5df2\u4e0a\u4f20\u56fe\u7247")
+        title.setObjectName("imageTitle")
+        pixmap = QPixmap(image_path)
+        preview = QLabel()
+        preview.setObjectName("imagePreview")
+        preview.setAlignment(Qt.AlignCenter)
+        if not pixmap.isNull():
+            preview.setPixmap(pixmap.scaled(260, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        meta = QLabel(Path(image_path).name)
+        meta.setObjectName("imageMeta")
+        meta.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(preview)
+        layout.addWidget(meta)
+        self.setStyleSheet("""QFrame#imageBubble { background: #FFFFFF; border: 1px solid #E6EBF2; border-radius: 18px; } QLabel#imageTitle { color: #475569; font-size: 11px; font-weight: 700; } QLabel#imageMeta { color: #334155; font-size: 12px; } QLabel#imagePreview { background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 14px; min-height: 120px; }""")
+
+
+class DraftPreviewCard(QFrame):
+    confirmRequested = Signal()
+    customizeRequested = Signal()
+    cancelRequested = Signal()
+    reuploadRequested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("draftCard")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+        self.status_label = QLabel("\u56fe\u7247\u8349\u7a3f")
+        self.status_label.setObjectName("draftTitle")
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setObjectName("draftSummary")
+        self.details_label = QLabel()
+        self.details_label.setWordWrap(True)
+        self.details_label.setObjectName("draftDetails")
+        button_row = QHBoxLayout()
+        self.confirm_button = QPushButton("\u786e\u8ba4\u751f\u6210")
+        self.customize_button = QPushButton("\u81ea\u5b9a\u4e49")
+        self.cancel_button = QPushButton("\u53d6\u6d88\u8349\u7a3f")
+        self.reupload_button = QPushButton("\u91cd\u65b0\u4e0a\u4f20")
+        self.confirm_button.clicked.connect(self.confirmRequested.emit)
+        self.customize_button.clicked.connect(self.customizeRequested.emit)
+        self.cancel_button.clicked.connect(self.cancelRequested.emit)
+        self.reupload_button.clicked.connect(self.reuploadRequested.emit)
+        for button in (self.confirm_button, self.customize_button, self.cancel_button, self.reupload_button):
+            button_row.addWidget(button)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.summary_label)
+        layout.addWidget(self.details_label)
+        layout.addLayout(button_row)
+        self.setStyleSheet("""QFrame#draftCard { background: #FFFFFF; border: 1px solid #E6EBF2; border-radius: 18px; } QLabel#draftTitle { color: #0F172A; font-size: 14px; font-weight: 700; } QLabel#draftSummary { color: #334155; font-size: 13px; } QLabel#draftDetails { color: #475569; font-size: 12px; background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 14px; padding: 10px 12px; } QPushButton { min-height: 34px; border-radius: 10px; padding: 6px 12px; font-weight: 600; }""")
+
+    def update_result(self, result: ImageAnalysisResult) -> None:
+        self.summary_label.setText(result.reply_text)
+        draft = result.draft
+        if draft is None:
+            self.status_label.setText("\u56fe\u7247\u8bc6\u522b\u7ed3\u679c")
+            self.details_label.setText("\u6ca1\u6709\u53ef\u7f16\u8f91\u7684\u8349\u7a3f\u3002")
+        else:
+            details = ["\u7c7b\u578b\uff1a" + (draft.topology or "\u672a\u8bc6\u522b")]
+            if draft.directional_lanes.has_any():
+                lane_text = "\uff1b".join(f"{DirectionalLaneConfig.edge_label(edge_id)} {getattr(draft.directional_lanes, edge_id)}" for edge_id in DirectionalLaneConfig.valid_edge_ids(draft.topology) if getattr(draft.directional_lanes, edge_id) is not None)
+                details.append(f"\u8f66\u9053\uff1a{lane_text}")
+            if draft.road_length_m is not None:
+                details.append(f"\u957f\u5ea6\uff1a{draft.road_length_m:.0f} m")
+            if draft.speed_limit_kmh is not None:
+                details.append(f"\u9650\u901f\uff1a{draft.speed_limit_kmh:.0f} km/h")
+            if draft.confidence is not None:
+                details.append(f"\u7f6e\u4fe1\u5ea6\uff1a{draft.confidence:.2f}")
+            self.status_label.setText(f"\u8def\u53e3\u8349\u7a3f \xb7 {draft.image_name()}")
+            self.details_label.setText("\n".join(details))
+        self.confirm_button.setVisible(result.allow_confirm)
+        self.customize_button.setVisible(result.allow_customize)
+        self.cancel_button.setVisible(result.draft is not None)
+        self.reupload_button.setVisible(result.allow_reupload)
 
 
 class ChatPanel(QWidget):
     messageSubmitted = Signal(str)
+    imageSelected = Signal(str)
+    draftConfirmRequested = Signal()
+    draftCustomizeRequested = Signal()
+    draftCancelRequested = Signal()
+    draftReuploadRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._draft_row: QWidget | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
-
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll_area.setFrameShape(QFrame.NoFrame)
-        self.scroll_area.setObjectName("chatScroll")
-
         self.messages_widget = QWidget()
-        self.messages_widget.setObjectName("chatStream")
         self.messages_layout = QVBoxLayout(self.messages_widget)
         self.messages_layout.setContentsMargins(6, 6, 6, 8)
         self.messages_layout.setSpacing(12)
         self.messages_layout.addWidget(WelcomeCard())
         self.messages_layout.addStretch(1)
         self.scroll_area.setWidget(self.messages_widget)
-
-        input_shell = QFrame()
-        input_shell.setObjectName("inputShell")
-        bottom_row = QHBoxLayout(input_shell)
-        bottom_row.setContentsMargins(12, 12, 12, 12)
-        bottom_row.setSpacing(8)
-
+        shell = QFrame()
+        shell.setObjectName("inputShell")
+        bottom = QHBoxLayout(shell)
+        bottom.setContentsMargins(12, 12, 12, 12)
+        bottom.setSpacing(8)
+        self.upload_button = QPushButton("\u4e0a\u4f20\u56fe\u7247")
+        self.upload_button.setObjectName("uploadButton")
+        self.upload_button.clicked.connect(self._choose_image)
         self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("比如：生成一个双向四车道十字路口，仿真 1800 秒")
+        self.input_edit.setPlaceholderText("\u4f8b\u5982\uff1a\u751f\u6210\u4e00\u4e2a\u53cc\u5411\u56db\u8f66\u9053\u5341\u5b57\u8def\u53e3\uff0c\u4eff\u771f 1800 \u79d2")
         self.input_edit.returnPressed.connect(self.submit_message)
         self.input_edit.setObjectName("chatInput")
-
-        self.send_button = QPushButton("发送")
-        self.send_button.clicked.connect(self.submit_message)
+        self.send_button = QPushButton("\u53d1\u9001")
         self.send_button.setObjectName("sendButton")
-
-        bottom_row.addWidget(self.input_edit, 1)
-        bottom_row.addWidget(self.send_button)
-
+        self.send_button.clicked.connect(self.submit_message)
+        bottom.addWidget(self.upload_button)
+        bottom.addWidget(self.input_edit, 1)
+        bottom.addWidget(self.send_button)
         layout.addWidget(self.scroll_area, 1)
-        layout.addWidget(input_shell)
+        layout.addWidget(shell)
         self._apply_style()
 
     def submit_message(self) -> None:
@@ -255,67 +220,89 @@ class ChatPanel(QWidget):
         self.input_edit.clear()
         self.messageSubmitted.emit(text)
 
+    def set_busy(self, busy: bool) -> None:
+        self.input_edit.setDisabled(busy)
+        self.send_button.setDisabled(busy)
+        self.upload_button.setDisabled(busy)
+        self.send_button.setText("\u5904\u7406\u4e2d..." if busy else "\u53d1\u9001")
+
     def append_user_message(self, text: str) -> QWidget:
-        return self._append_message("user", text)
+        return self._append_widget(MessageBubble("user", text), align_right=True)
 
     def append_agent_message(self, text: str) -> QWidget:
-        return self._append_message("assistant", text)
+        return self._append_widget(MessageBubble("assistant", text))
 
     def append_status_message(self, text: str) -> QWidget:
-        return self._append_message("status", text)
+        return self._append_widget(MessageBubble("status", text))
 
-    def append_agent_placeholder(self, text: str = "通通正在理解你的需求...") -> QWidget:
-        return self.append_status_message(text)
+    def append_image_message(self, image_path: str) -> QWidget:
+        return self._append_widget(ImageBubble(image_path), align_right=True)
+
+    def show_draft_preview(self, result: ImageAnalysisResult) -> QWidget:
+        card = DraftPreviewCard()
+        card.update_result(result)
+        card.confirmRequested.connect(self.draftConfirmRequested.emit)
+        card.customizeRequested.connect(self.draftCustomizeRequested.emit)
+        card.cancelRequested.connect(self.draftCancelRequested.emit)
+        card.reuploadRequested.connect(self.draftReuploadRequested.emit)
+        self._draft_row = self._append_widget(card) if self._draft_row is None else self.replace_widget(self._draft_row, card)
+        return self._draft_row
+
+    def clear_draft_preview(self) -> None:
+        if self._draft_row is None:
+            return
+        self.messages_layout.removeWidget(self._draft_row)
+        self._draft_row.deleteLater()
+        self._draft_row = None
+        self._scroll_to_bottom()
 
     def update_message(self, row_widget: QWidget, role: str, text: str) -> QWidget:
         bubble = row_widget.findChild(MessageBubble)
         if bubble is None or bubble.role != role:
-            return self.replace_message(row_widget, role, text)
+            return self.replace_widget(row_widget, MessageBubble(role, text))
         bubble.set_text(text)
         self._update_bubble_widths()
         self._scroll_to_bottom()
         return row_widget
 
     def replace_message(self, row_widget: QWidget, role: str, text: str) -> QWidget:
+        return self.replace_widget(row_widget, MessageBubble(role, text))
+
+    def replace_widget(self, row_widget: QWidget, inner: QWidget) -> QWidget:
         index = self.messages_layout.indexOf(row_widget)
         if index < 0:
-            return self._append_message(role, text)
-
+            return self._append_widget(inner)
         self.messages_layout.removeWidget(row_widget)
         row_widget.deleteLater()
-        new_row = self._create_message_row(role, text)
+        new_row = self._wrap_widget(inner, isinstance(inner, MessageBubble) and inner.role == "user")
         self.messages_layout.insertWidget(index, new_row)
         self._update_bubble_widths()
         self._scroll_to_bottom()
         return new_row
 
-    def set_busy(self, busy: bool) -> None:
-        self.input_edit.setDisabled(busy)
-        self.send_button.setDisabled(busy)
-        self.send_button.setText("处理中..." if busy else "发送")
-
-    def _append_message(self, role: str, text: str) -> QWidget:
-        row_widget = self._create_message_row(role, text)
-        self.messages_layout.insertWidget(self.messages_layout.count() - 1, row_widget)
+    def _append_widget(self, inner: QWidget, align_right: bool = False) -> QWidget:
+        row = self._wrap_widget(inner, align_right)
+        self.messages_layout.insertWidget(self.messages_layout.count() - 1, row)
         self._update_bubble_widths()
         self._scroll_to_bottom()
-        return row_widget
+        return row
 
-    def _create_message_row(self, role: str, text: str) -> QWidget:
-        row_widget = QWidget()
-        row_widget.setStyleSheet("background: transparent;")
-        row_layout = QHBoxLayout(row_widget)
-        row_layout.setContentsMargins(4, 0, 4, 0)
-        row_layout.setSpacing(0)
-
-        bubble = MessageBubble(role, text)
-        if role == "user":
-            row_layout.addStretch(1)
-            row_layout.addWidget(bubble, 0, Qt.AlignRight)
+    def _wrap_widget(self, inner: QWidget, align_right: bool) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(4, 0, 4, 0)
+        if align_right:
+            layout.addStretch(1)
+            layout.addWidget(inner, 0, Qt.AlignRight)
         else:
-            row_layout.addWidget(bubble, 0, Qt.AlignLeft)
-            row_layout.addStretch(1)
-        return row_widget
+            layout.addWidget(inner, 0, Qt.AlignLeft)
+            layout.addStretch(1)
+        return row
+
+    def _choose_image(self) -> None:
+        image_path, _ = QFileDialog.getOpenFileName(self, "\u9009\u62e9\u8def\u53e3\u56fe\u7247", "", "Images (*.png *.jpg *.jpeg *.webp)")
+        if image_path:
+            self.imageSelected.emit(image_path)
 
     def _update_bubble_widths(self) -> None:
         viewport_width = max(340, self.scroll_area.viewport().width())
@@ -332,49 +319,4 @@ class ChatPanel(QWidget):
         self._update_bubble_widths()
 
     def _apply_style(self) -> None:
-        self.setStyleSheet(
-            """
-            QWidget {
-                background: transparent;
-            }
-            QScrollArea#chatScroll {
-                background: #F7FAFD;
-                border: none;
-            }
-            QWidget#chatStream {
-                background: #F7FAFD;
-            }
-            QFrame#inputShell {
-                background: #FFFFFF;
-                border: 1px solid #E3EAF4;
-                border-radius: 18px;
-            }
-            QLineEdit#chatInput {
-                background: #FFFFFF;
-                border: none;
-                color: #0F172A;
-                padding: 10px 4px;
-                font-size: 13px;
-            }
-            QLineEdit#chatInput:focus {
-                border: none;
-            }
-            QPushButton#sendButton {
-                min-height: 40px;
-                min-width: 72px;
-                background: #111827;
-                color: #FFFFFF;
-                border: none;
-                border-radius: 14px;
-                padding: 10px 14px;
-                font-weight: 700;
-            }
-            QPushButton#sendButton:hover {
-                background: #1F2937;
-            }
-            QPushButton#sendButton:disabled {
-                background: #CBD5E1;
-                color: #F8FAFC;
-            }
-            """
-        )
+        self.setStyleSheet("""QWidget { background: transparent; } QFrame#inputShell { background: #FFFFFF; border: 1px solid #E3EAF4; border-radius: 18px; } QLineEdit#chatInput { background: #FFFFFF; border: none; color: #0F172A; padding: 10px 4px; font-size: 13px; } QPushButton#sendButton, QPushButton#uploadButton { min-height: 40px; border-radius: 14px; padding: 10px 14px; font-weight: 700; } QPushButton#sendButton { background: #111827; color: #FFFFFF; border: none; } QPushButton#uploadButton { background: #FFFFFF; color: #0F172A; border: 1px solid #CBD5E1; } QPushButton#sendButton:disabled, QPushButton#uploadButton:disabled { background: #CBD5E1; color: #F8FAFC; border-color: #CBD5E1; }""")

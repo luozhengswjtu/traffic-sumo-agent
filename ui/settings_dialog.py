@@ -1,6 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -17,7 +18,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.resize(520, 420)
+        self.resize(520, 460)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -27,6 +28,7 @@ class SettingsDialog(QDialog):
         self.base_url_edit = QLineEdit()
         self.api_key_edit = QLineEdit()
         self.model_edit = QLineEdit()
+        self.supports_vision_check = QCheckBox("当前模型支持图片识别")
         self.default_scenario_edit = QLineEdit()
         self.default_flow_edit = QLineEdit()
         self.default_duration_spin = QSpinBox()
@@ -37,6 +39,7 @@ class SettingsDialog(QDialog):
         form.addRow("Base URL", self.base_url_edit)
         form.addRow("API Key", self.api_key_edit)
         form.addRow("模型名", self.model_edit)
+        form.addRow("视觉能力", self.supports_vision_check)
         form.addRow("默认场景", self.default_scenario_edit)
         form.addRow("默认流量", self.default_flow_edit)
         form.addRow("默认时长", self.default_duration_spin)
@@ -53,6 +56,7 @@ class SettingsDialog(QDialog):
         self.base_url_edit.setText(model_config.base_url)
         self.api_key_edit.setText(model_config.api_key)
         self.model_edit.setText(model_config.model)
+        self.supports_vision_check.setChecked(model_config.supports_vision)
         self.default_scenario_edit.setText(user_preferences.default_scenario_type)
         self.default_flow_edit.setText(user_preferences.default_flow_level)
         self.default_duration_spin.setValue(user_preferences.default_duration)
@@ -63,6 +67,7 @@ class SettingsDialog(QDialog):
             base_url=self.base_url_edit.text().strip() or ModelConfig().base_url,
             api_key=self.api_key_edit.text().strip(),
             model=self.model_edit.text().strip() or ModelConfig().model,
+            supports_vision=self.supports_vision_check.isChecked(),
         )
 
     def collect_user_preferences(self) -> UserPreferences:

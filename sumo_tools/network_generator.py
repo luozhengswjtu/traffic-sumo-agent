@@ -1,13 +1,15 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from sumo_domain.network_spec import EdgeSpec, NetworkSpec, NodeSpec
+from sumo_domain.project_spec import DirectionalLaneConfig
 
 
 class NetworkGenerationRequest(BaseModel):
     scenario_type: str = "intersection"
     lane_count: int = 2
+    directional_lanes: DirectionalLaneConfig = Field(default_factory=DirectionalLaneConfig)
     road_length: float = 200.0
     speed_limit: float = 13.89
     node_type: str = "priority"
@@ -82,11 +84,12 @@ class NetworkGenerator:
 
     @staticmethod
     def _edge(edge_id: str, from_node: str, to_node: str, spec: NetworkGenerationRequest) -> EdgeSpec:
+        lane_map = spec.directional_lanes.to_edge_lane_map(spec.scenario_type, spec.lane_count)
         return EdgeSpec(
             id=edge_id,
             from_node=from_node,
             to_node=to_node,
-            num_lanes=spec.lane_count,
+            num_lanes=lane_map.get(edge_id, spec.lane_count),
             speed=spec.speed_limit,
             length=spec.road_length / 2.0,
         )
