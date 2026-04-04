@@ -1,12 +1,13 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QLabel,
     QMainWindow,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -34,6 +36,30 @@ if TYPE_CHECKING:
     from agent.orchestrator import AgentExecutionResult
 
 
+class ChatRequestWorker(QObject):
+    progressChanged = Signal(object)
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, orchestrator, text: str, project: ProjectContext | None) -> None:
+        super().__init__()
+        self._orchestrator = orchestrator
+        self._text = text
+        self._project = project.model_copy(deep=True) if project is not None else None
+
+    def run(self) -> None:
+        try:
+            result = self._orchestrator.handle_user_message(
+                self._text,
+                self._project,
+                progress_callback=self.progressChanged.emit,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.succeeded.emit(result)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -41,8 +67,13 @@ class MainWindow(QMainWindow):
         self.current_project_meta: ProjectMeta | None = None
         self.current_project_context: ProjectContext | None = None
         self.current_simulation_spec = SimulationSpec()
-        self.setWindowTitle("TrafficAgent")
-        self.resize(1360, 820)
+        self.workspace_tabs: QTabWidget | None = None
+        self._chat_thread: QThread | None = None
+        self._chat_worker: ChatRequestWorker | None = None
+        self._chat_placeholder: QWidget | None = None
+        self._close_after_chat = False
+        self.setWindowTitle("\u901a\u901a \u00b7 TrafficAgent")
+        self.resize(1420, 860)
         self._build_ui()
         self._build_menu()
 
@@ -54,9 +85,16 @@ class MainWindow(QMainWindow):
         self.container.sim_runner.logProduced.connect(self.append_log)
         self.container.sim_runner.runFailed.connect(self.show_error)
         self.history_panel.clear_records()
-        self.chat_panel.append_agent_message("可以直接输入：生成一个十字路口，仿真120秒。也可以直接点运行，系统会自动创建临时项目。")
-        self.append_log("基础服务已绑定。")
-        self.statusBar().showMessage("准备就绪")
+        self.append_log("\u901a\u901a\u670d\u52a1\u5df2\u7ed1\u5b9a\u3002")
+        self.statusBar().showMessage("\u901a\u901a\u5df2\u5c31\u7eea")
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self._chat_thread is not None and self._chat_thread.isRunning():
+            self._close_after_chat = True
+            self.statusBar().showMessage("\u6b63\u5728\u7b49\u5f85\u901a\u901a\u5b8c\u6210\u5f53\u524d\u56de\u590d\u540e\u518d\u5173\u95ed...")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _build_ui(self) -> None:
         splitter = QSplitter(Qt.Horizontal)
@@ -69,6 +107,7 @@ class MainWindow(QMainWindow):
 
         right_panel = QWidget()
         right_panel.setObjectName("rightWorkspace")
+        right_panel.setMinimumWidth(440)
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(12)
@@ -86,24 +125,15 @@ class MainWindow(QMainWindow):
         self.history_panel.refreshRequested.connect(self._refresh_history_panel)
 
         workspace_header = self._build_workspace_header()
-        log_card = self._build_log_card()
-
-        self.log_output = QPlainTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setPlaceholderText("这里会显示执行日志、项目创建记录和后续仿真输出。")
-        self.log_output.setObjectName("logOutput")
-        log_card.layout().addWidget(self.log_output)
+        self.workspace_tabs = self._build_workspace_tabs()
 
         right_layout.addWidget(workspace_header)
-        right_layout.addWidget(self.control_panel)
-        right_layout.addWidget(self.sim_status_panel)
-        right_layout.addWidget(self.history_panel, 3)
-        right_layout.addWidget(log_card, 2)
+        right_layout.addWidget(self.workspace_tabs, 1)
 
         splitter.addWidget(self.chat_panel)
         splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 5)
-        splitter.setStretchFactor(1, 4)
+        splitter.setStretchFactor(0, 6)
+        splitter.setStretchFactor(1, 5)
 
         wrapper = QWidget()
         wrapper.setObjectName("mainWrapper")
@@ -117,27 +147,59 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status)
         self._apply_window_style()
 
+    def _build_workspace_tabs(self) -> QTabWidget:
+        tabs = QTabWidget()
+        tabs.setObjectName("workspaceTabs")
+        tabs.setDocumentMode(True)
+        tabs.setUsesScrollButtons(False)
+
+        control_page = QWidget()
+        control_layout = QVBoxLayout(control_page)
+        control_layout.setContentsMargins(0, 6, 0, 0)
+        control_layout.addWidget(self.control_panel)
+
+        status_page = QWidget()
+        status_layout = QVBoxLayout(status_page)
+        status_layout.setContentsMargins(0, 6, 0, 0)
+        status_layout.addWidget(self.sim_status_panel)
+
+        history_page = QWidget()
+        history_layout = QVBoxLayout(history_page)
+        history_layout.setContentsMargins(0, 6, 0, 0)
+        history_layout.addWidget(self.history_panel)
+
+        log_page = QWidget()
+        log_layout = QVBoxLayout(log_page)
+        log_layout.setContentsMargins(0, 6, 0, 0)
+        log_layout.addWidget(self._build_log_card())
+
+        tabs.addTab(control_page, "\u63a7\u5236")
+        tabs.addTab(status_page, "\u72b6\u6001")
+        tabs.addTab(history_page, "\u5386\u53f2")
+        tabs.addTab(log_page, "\u65e5\u5fd7")
+        return tabs
+
     def _build_menu(self) -> None:
         menu = self.menuBar()
-        file_menu = menu.addMenu("文件")
-        settings_menu = menu.addMenu("设置")
-        view_menu = menu.addMenu("视图")
+        file_menu = menu.addMenu("\u6587\u4ef6")
+        settings_menu = menu.addMenu("\u8bbe\u7f6e")
+        view_menu = menu.addMenu("\u89c6\u56fe")
 
-        new_project_action = QAction("新建项目", self)
+        new_project_action = QAction("\u65b0\u5efa\u9879\u76ee", self)
         new_project_action.triggered.connect(self._create_project)
         file_menu.addAction(new_project_action)
 
-        settings_action = QAction("模型与偏好设置", self)
+        settings_action = QAction("\u6a21\u578b\u4e0e\u504f\u597d\u8bbe\u7f6e", self)
         settings_action.triggered.connect(self._open_settings)
         settings_menu.addAction(settings_action)
 
-        refresh_history_action = QAction("刷新操作历史", self)
+        refresh_history_action = QAction("\u5237\u65b0\u64cd\u4f5c\u5386\u53f2", self)
         refresh_history_action.triggered.connect(self._refresh_history_panel)
         view_menu.addAction(refresh_history_action)
 
     def load_project(self, path: Path) -> None:
         if self.container is None:
-            self.show_error("服务尚未初始化，暂时无法加载项目。")
+            self.show_error("\u670d\u52a1\u5c1a\u672a\u521d\u59cb\u5316\uff0c\u6682\u65f6\u65e0\u6cd5\u52a0\u8f7d\u9879\u76ee\u3002")
             return
 
         try:
@@ -148,28 +210,28 @@ class MainWindow(QMainWindow):
 
         self.current_project_meta = meta
         self.current_project_context = ProjectContext(meta=meta, simulation=self.current_simulation_spec)
-        self.append_log(f"已加载项目：{meta.name}")
-        self.statusBar().showMessage(f"当前项目：{meta.name}")
+        self.append_log(f"\u5df2\u52a0\u8f7d\u9879\u76ee\uff1a{meta.name}")
+        self.statusBar().showMessage(f"\u5f53\u524d\u9879\u76ee\uff1a{meta.name}")
         self._remember_recent_project(meta)
         self._refresh_history_panel()
 
     def refresh_project_view(self) -> None:
         if self.current_project_meta is None:
-            self.statusBar().showMessage("尚未打开项目")
+            self.statusBar().showMessage("\u5c1a\u672a\u6253\u5f00\u9879\u76ee")
             return
-        self.statusBar().showMessage(f"当前项目：{self.current_project_meta.name}")
+        self.statusBar().showMessage(f"\u5f53\u524d\u9879\u76ee\uff1a{self.current_project_meta.name}")
 
     def append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_output.appendPlainText(f"[{timestamp}] {message}")
 
     def show_error(self, message: str) -> None:
-        QMessageBox.critical(self, "错误", message)
-        self.append_log(f"错误：{message}")
+        QMessageBox.critical(self, "\u9519\u8bef", message)
+        self.append_log(f"\u9519\u8bef\uff1a{message}")
 
     def _create_project(self) -> None:
         if self.container is None:
-            self.show_error("服务尚未初始化，暂时无法创建项目。")
+            self.show_error("\u670d\u52a1\u5c1a\u672a\u521d\u59cb\u5316\uff0c\u6682\u65f6\u65e0\u6cd5\u521b\u5efa\u9879\u76ee\u3002")
             return
 
         dialog = NewProjectDialog(self.container.paths.projects_dir, self)
@@ -179,7 +241,7 @@ class MainWindow(QMainWindow):
         name = dialog.collect_project_name()
         base_dir = dialog.collect_project_path()
         if not name:
-            self.show_error("项目名称不能为空。")
+            self.show_error("\u9879\u76ee\u540d\u79f0\u4e0d\u80fd\u4e3a\u7a7a\u3002")
             return
 
         meta = self.container.project_store.create_project(name, base_dir)
@@ -195,14 +257,14 @@ class MainWindow(QMainWindow):
                 seed=self.current_simulation_spec.seed,
             ),
         )
-        self.append_log(f"已创建项目：{meta.name}")
-        self.statusBar().showMessage(f"当前项目：{meta.name}")
+        self.append_log(f"\u5df2\u521b\u5efa\u9879\u76ee\uff1a{meta.name}")
+        self.statusBar().showMessage(f"\u5f53\u524d\u9879\u76ee\uff1a{meta.name}")
         self._remember_recent_project(meta)
         self._refresh_history_panel()
 
     def _open_settings(self) -> None:
         if self.container is None:
-            self.show_error("服务尚未初始化，暂时无法打开设置。")
+            self.show_error("\u670d\u52a1\u5c1a\u672a\u521d\u59cb\u5316\uff0c\u6682\u65f6\u65e0\u6cd5\u6253\u5f00\u8bbe\u7f6e\u3002")
             return
 
         dialog = SettingsDialog(self)
@@ -214,39 +276,92 @@ class MainWindow(QMainWindow):
         self.container.user_preferences = dialog.collect_user_preferences()
         self.container.config_store.save_model_config(self.container.model_config)
         self.container.config_store.save_user_preferences(self.container.user_preferences)
-        self.append_log("已保存模型配置和用户偏好。")
+        self.append_log("\u5df2\u4fdd\u5b58\u6a21\u578b\u914d\u7f6e\u548c\u7528\u6237\u504f\u597d\u3002")
 
     def _handle_chat_message(self, text: str) -> None:
         if self.container is None:
-            self.show_error("服务尚未初始化。")
+            self.show_error("\u670d\u52a1\u5c1a\u672a\u521d\u59cb\u5316\u3002")
+            return
+        if self._chat_thread is not None:
+            self.statusBar().showMessage("\u901a\u901a\u6b63\u5728\u5904\u7406\u4e0a\u4e00\u6761\u6d88\u606f\u3002")
             return
 
-        placeholder = self.chat_panel.append_agent_placeholder()
+        self._chat_placeholder = self.chat_panel.append_status_message("\u901a\u901a\u6b63\u5728\u7406\u89e3\u4f60\u7684\u9700\u6c42...")
         self.chat_panel.set_busy(True)
-        try:
-            result = self.container.agent_orchestrator.handle_user_message(text, self.current_project_context)
-            reply_text = result.reply_text.strip() if result.reply_text else "请求已处理，但当前没有返回说明。"
-            self.chat_panel.replace_message(placeholder, "agent", reply_text)
-            self._apply_agent_result(result)
-        except Exception as exc:
-            self.chat_panel.replace_message(placeholder, "agent", f"处理消息时出错：{exc}")
-            self.append_log(f"聊天处理异常：{exc}")
-        finally:
-            self.chat_panel.set_busy(False)
+        self.statusBar().showMessage("\u901a\u901a\u6b63\u5728\u5904\u7406\u4f60\u7684\u6d88\u606f...")
+        QApplication.processEvents()
+        self._start_chat_worker(text)
+
+    def _start_chat_worker(self, text: str) -> None:
+        if self.container is None:
+            return
+
+        project_snapshot = self.current_project_context.model_copy(deep=True) if self.current_project_context is not None else None
+        self._chat_thread = QThread()
+        self._chat_worker = ChatRequestWorker(self.container.agent_orchestrator, text, project_snapshot)
+        self._chat_worker.moveToThread(self._chat_thread)
+
+        self._chat_thread.started.connect(self._chat_worker.run)
+        self._chat_worker.progressChanged.connect(self._on_chat_progress)
+        self._chat_worker.succeeded.connect(self._on_chat_succeeded)
+        self._chat_worker.failed.connect(self._on_chat_failed)
+        self._chat_worker.succeeded.connect(self._chat_thread.quit)
+        self._chat_worker.failed.connect(self._chat_thread.quit)
+        self._chat_thread.finished.connect(self._chat_worker.deleteLater)
+        self._chat_thread.finished.connect(self._cleanup_chat_worker)
+        self._chat_thread.finished.connect(self._chat_thread.deleteLater)
+        self._chat_thread.start()
+
+    def _on_chat_progress(self, progress) -> None:
+        if self._chat_placeholder is not None:
+            self.chat_panel.update_message(self._chat_placeholder, "status", progress.message)
+        self.statusBar().showMessage(progress.message)
+
+    def _on_chat_succeeded(self, result: AgentExecutionResult) -> None:
+        reply_text = result.reply_text.strip() if result.reply_text else "\u8bf7\u6c42\u5df2\u5904\u7406\uff0c\u4f46\u5f53\u524d\u6ca1\u6709\u8fd4\u56de\u8bf4\u660e\u3002"
+        if self._chat_placeholder is not None:
+            self.chat_panel.replace_message(self._chat_placeholder, "assistant", reply_text)
+            self._chat_placeholder = None
+        else:
+            self.chat_panel.append_agent_message(reply_text)
+
+        self._apply_agent_result(result)
+        self.chat_panel.set_busy(False)
+        self.statusBar().showMessage(f"{result.assistant_name} \u5df2\u5b8c\u6210\u672c\u8f6e\u5904\u7406")
+
+    def _on_chat_failed(self, error_message: str) -> None:
+        message = f"\u5904\u7406\u6d88\u606f\u65f6\u51fa\u9519\uff1a{error_message}"
+        if self._chat_placeholder is not None:
+            self.chat_panel.replace_message(self._chat_placeholder, "assistant", message)
+            self._chat_placeholder = None
+        else:
+            self.chat_panel.append_agent_message(message)
+        self.append_log(f"\u804a\u5929\u5904\u7406\u5f02\u5e38\uff1a{error_message}")
+        self.chat_panel.set_busy(False)
+        self.statusBar().showMessage("\u901a\u901a\u5904\u7406\u5931\u8d25")
+
+    def _cleanup_chat_worker(self) -> None:
+        self._chat_worker = None
+        self._chat_thread = None
+        if self._close_after_chat:
+            self._close_after_chat = False
+            self.close()
 
     def _handle_run_requested(self) -> None:
         if self.container is None:
-            self.show_error("服务尚未初始化。")
+            self.show_error("\u670d\u52a1\u5c1a\u672a\u521d\u59cb\u5316\u3002")
             return
         if self.current_project_meta is None:
             self._create_implicit_project_for_run()
         if self.current_project_meta is None:
-            self.show_error("无法创建运行项目。")
+            self.show_error("\u65e0\u6cd5\u521b\u5efa\u8fd0\u884c\u9879\u76ee\u3002")
             return
         if not self._ensure_project_built():
             return
 
-        self.append_log("收到运行请求，准备通过 TraCI 启动 SUMO。")
+        if self.workspace_tabs is not None:
+            self.workspace_tabs.setCurrentIndex(1)
+        self.append_log("\u6536\u5230\u8fd0\u884c\u8bf7\u6c42\uff0c\u51c6\u5907\u901a\u8fc7 TraCI \u542f\u52a8 SUMO\u3002")
         self.container.sim_runner.start_project(Path(self.current_project_meta.project_dir))
 
     def _handle_pause_requested(self) -> None:
@@ -284,7 +399,7 @@ class MainWindow(QMainWindow):
             self.current_project_context = self.current_project_context.model_copy(
                 update={"simulation": spec, "scenario_state": scenario_state}
             )
-        self.append_log(f"参数已更新：时长={spec.end_time}s, 步长={spec.step_length}, seed={spec.seed}")
+        self.append_log(f"\u53c2\u6570\u5df2\u66f4\u65b0\uff1a\u65f6\u957f={spec.end_time}s, \u6b65\u957f={spec.step_length}, seed={spec.seed}")
 
     def _apply_agent_result(self, result: AgentExecutionResult) -> None:
         if result.updated_project is not None:
@@ -292,29 +407,33 @@ class MainWindow(QMainWindow):
             self.current_project_meta = result.updated_project.meta
             self.current_simulation_spec = result.updated_project.simulation or self.current_simulation_spec
             self.control_panel.load_simulation_spec(self.current_simulation_spec)
-            self.statusBar().showMessage(f"当前项目：{self.current_project_meta.name}")
+            self.statusBar().showMessage(f"\u5f53\u524d\u9879\u76ee\uff1a{self.current_project_meta.name}")
             self._remember_recent_project(self.current_project_meta)
 
         if result.operation_summary:
-            self.append_log(f"变更确认：{result.operation_summary.replace(chr(10), ' | ')}")
+            self.append_log(f"\u53d8\u66f4\u786e\u8ba4\uff1a{result.operation_summary.replace(chr(10), ' | ')}")
         if result.history_record_id is not None:
-            self.append_log(f"已写入操作历史：#{result.history_record_id}")
+            self.append_log(f"\u5df2\u5199\u5165\u64cd\u4f5c\u5386\u53f2\uff1a#{result.history_record_id}")
 
         for file_path in result.generated_files:
-            self.append_log(f"已生成文件：{file_path}")
+            self.append_log(f"\u5df2\u751f\u6210\u6587\u4ef6\uff1a{file_path}")
         for issue in result.issues:
-            self.append_log(f"{issue}")
+            self.append_log(issue)
 
         self._refresh_history_panel(result.history_record_id)
 
         if result.should_run_simulation:
             if self.current_project_meta is None:
-                self.show_error("当前没有可运行的项目。")
+                self.show_error("\u5f53\u524d\u6ca1\u6709\u53ef\u8fd0\u884c\u7684\u9879\u76ee\u3002")
                 return
             if not self._ensure_project_built():
                 return
-            self.append_log("Agent 请求直接运行仿真。")
+            if self.workspace_tabs is not None:
+                self.workspace_tabs.setCurrentIndex(1)
+            self.append_log("Agent \u8bf7\u6c42\u76f4\u63a5\u8fd0\u884c\u4eff\u771f\u3002")
             self.container.sim_runner.start_project(Path(self.current_project_meta.project_dir))
+        elif result.history_record_id is not None and self.workspace_tabs is not None:
+            self.workspace_tabs.setCurrentIndex(2)
 
     def _create_implicit_project_for_run(self) -> None:
         if self.container is None:
@@ -334,10 +453,10 @@ class MainWindow(QMainWindow):
                 seed=self.current_simulation_spec.seed,
             ),
         )
-        self.statusBar().showMessage(f"当前项目：{meta.name}")
+        self.statusBar().showMessage(f"\u5f53\u524d\u9879\u76ee\uff1a{meta.name}")
         self._remember_recent_project(meta)
         self._refresh_history_panel()
-        self.append_log(f"未检测到当前项目，已自动创建临时项目：{meta.name}")
+        self.append_log(f"\u672a\u68c0\u6d4b\u5230\u5f53\u524d\u9879\u76ee\uff0c\u5df2\u81ea\u52a8\u521b\u5efa\u4e34\u65f6\u9879\u76ee\uff1a{meta.name}")
 
     def _refresh_history_panel(self, selected_record_id: int | None = None) -> None:
         if self.container is None:
@@ -359,35 +478,35 @@ class MainWindow(QMainWindow):
         has_validation_errors = any(issue.level == "error" for issue in validation_issues)
         sumocfg_path = project_dir / "sumo" / "scenario.sumocfg"
         if sumocfg_path.exists() and not has_validation_errors:
-            self._log_validation_issues(validation_issues, prefix="运行前校验")
+            self._log_validation_issues(validation_issues, prefix="\u8fd0\u884c\u524d\u6821\u9a8c")
             return True
 
         if validation_issues:
-            self.append_log("当前项目输出不完整或不可运行，准备重建。")
-            self._log_validation_issues(validation_issues, prefix="运行前校验")
+            self.append_log("\u5f53\u524d\u9879\u76ee\u8f93\u51fa\u4e0d\u5b8c\u6574\u6216\u4e0d\u53ef\u8fd0\u884c\uff0c\u51c6\u5907\u91cd\u5efa\u3002")
+            self._log_validation_issues(validation_issues, prefix="\u8fd0\u884c\u524d\u6821\u9a8c")
 
         if self.current_project_context is not None and self.current_project_context.network and self.current_project_context.routes and self.current_project_context.simulation:
-            self.append_log("按当前项目上下文重新构建 SUMO 文件。")
+            self.append_log("\u6309\u5f53\u524d\u9879\u76ee\u4e0a\u4e0b\u6587\u91cd\u65b0\u6784\u5efa SUMO \u6587\u4ef6\u3002")
             result = self.container.project_builder.build_project(self.current_project_context)
             for file_path in result.generated_files:
-                self.append_log(f"已生成文件：{file_path}")
-            self._log_validation_issues(result.issues, prefix="构建结果")
+                self.append_log(f"\u5df2\u751f\u6210\u6587\u4ef6\uff1a{file_path}")
+            self._log_validation_issues(result.issues, prefix="\u6784\u5efa\u7ed3\u679c")
 
             final_issues = self.container.validator.validate_project(project_dir)
-            self._log_validation_issues(final_issues, prefix="重建后校验")
+            self._log_validation_issues(final_issues, prefix="\u91cd\u5efa\u540e\u6821\u9a8c")
             if any(issue.level == "error" for issue in final_issues):
-                self.show_error("当前项目重建失败，请查看日志。")
+                self.show_error("\u5f53\u524d\u9879\u76ee\u91cd\u5efa\u5931\u8d25\uff0c\u8bf7\u67e5\u770b\u65e5\u5fd7\u3002")
                 return False
             return True
 
         existing_sumo_files = [item.name for item in (project_dir / "sumo").glob("*") if item.is_file()]
         if existing_sumo_files:
-            self.append_log("检测到当前项目存在残缺的 SUMO 文件，但没有可恢复的完整上下文，已阻止自动覆盖。")
-            self.append_log(f"残缺文件：{', '.join(existing_sumo_files)}")
-            self.show_error("当前项目文件不完整，且缺少可恢复的项目上下文。请通过聊天重新生成场景，或新建项目。")
+            self.append_log("\u68c0\u6d4b\u5230\u5f53\u524d\u9879\u76ee\u5b58\u5728\u6b8b\u7f3a\u7684 SUMO \u6587\u4ef6\uff0c\u4f46\u6ca1\u6709\u53ef\u6062\u590d\u7684\u5b8c\u6574\u4e0a\u4e0b\u6587\uff0c\u5df2\u963b\u6b62\u81ea\u52a8\u8986\u76d6\u3002")
+            self.append_log(f"\u6b8b\u7f3a\u6587\u4ef6\uff1a{', '.join(existing_sumo_files)}")
+            self.show_error("\u5f53\u524d\u9879\u76ee\u6587\u4ef6\u4e0d\u5b8c\u6574\uff0c\u4e14\u7f3a\u5c11\u53ef\u6062\u590d\u7684\u9879\u76ee\u4e0a\u4e0b\u6587\u3002\u8bf7\u901a\u8fc7\u804a\u5929\u91cd\u65b0\u751f\u6210\u573a\u666f\uff0c\u6216\u65b0\u5efa\u9879\u76ee\u3002")
             return False
 
-        self.append_log("当前项目还没有可用 SUMO 文件，自动生成默认场景。")
+        self.append_log("\u5f53\u524d\u9879\u76ee\u8fd8\u6ca1\u6709\u53ef\u7528 SUMO \u6587\u4ef6\uff0c\u81ea\u52a8\u751f\u6210\u9ed8\u8ba4\u573a\u666f\u3002")
         network_request = NetworkGenerationRequest(
             scenario_type=self.container.user_preferences.default_scenario_type,
             lane_count=2,
@@ -425,13 +544,13 @@ class MainWindow(QMainWindow):
         result = self.container.project_builder.build_project(self.current_project_context)
 
         for file_path in result.generated_files:
-            self.append_log(f"已生成文件：{file_path}")
-        self._log_validation_issues(result.issues, prefix="构建结果")
+            self.append_log(f"\u5df2\u751f\u6210\u6587\u4ef6\uff1a{file_path}")
+        self._log_validation_issues(result.issues, prefix="\u6784\u5efa\u7ed3\u679c")
 
         final_issues = self.container.validator.validate_project(project_dir)
-        self._log_validation_issues(final_issues, prefix="重建后校验")
+        self._log_validation_issues(final_issues, prefix="\u91cd\u5efa\u540e\u6821\u9a8c")
         if any(issue.level == "error" for issue in final_issues):
-            self.show_error("默认场景生成失败，请查看日志。")
+            self.show_error("\u9ed8\u8ba4\u573a\u666f\u751f\u6210\u5931\u8d25\uff0c\u8bf7\u67e5\u770b\u65e5\u5fd7\u3002")
             return False
         return True
 
@@ -453,11 +572,14 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(6)
 
-        eyebrow = QLabel("WORKSPACE")
+        eyebrow = QLabel("CONTROL ROOM")
         eyebrow.setObjectName("workspaceEyebrow")
-        title = QLabel("右侧工作台")
+        title = QLabel("\u53f3\u4fa7\u5de5\u4f5c\u53f0")
         title.setObjectName("workspaceTitle")
-        description = QLabel("参数、状态、历史和日志集中展示，风格更柔和，与聊天区协调但不重复。")
+        description = QLabel(
+            "\u53c2\u6570\u3001\u72b6\u6001\u3001\u5386\u53f2\u548c\u65e5\u5fd7\u5df2\u5207\u6362\u4e3a\u6807\u7b7e\u5de5\u4f5c\u533a\uff0c"
+            "\u907f\u514d\u5c0f\u5c4f\u6216\u72ed\u5bbd\u5e03\u5c40\u4e0b\u5404\u4e2a\u6a21\u5757\u4e92\u76f8\u6324\u538b\u3002"
+        )
         description.setObjectName("workspaceDescription")
         description.setWordWrap(True)
 
@@ -473,34 +595,68 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(12)
 
-        title = QLabel("运行日志")
+        title = QLabel("\u6267\u884c\u65e5\u5fd7")
         title.setObjectName("workspaceCardTitle")
-        hint = QLabel("保留执行时间线，方便定位生成、校验和仿真过程中的状态变化。")
+        hint = QLabel("\u8fd9\u91cc\u4fdd\u7559\u5de5\u5177\u6267\u884c\u3001\u6784\u5efa\u6821\u9a8c\u548c\u4eff\u771f\u8fd0\u884c\u7684\u65f6\u95f4\u7ebf\uff0c\u65b9\u4fbf\u5feb\u901f\u5b9a\u4f4d\u95ee\u9898\u3002")
         hint.setObjectName("workspaceCardHint")
         hint.setWordWrap(True)
 
+        self.log_output = QPlainTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setPlaceholderText("\u8fd9\u91cc\u4f1a\u663e\u793a\u901a\u901a\u7684\u6267\u884c\u65f6\u95f4\u7ebf\u3001\u9879\u76ee\u6784\u5efa\u8bb0\u5f55\u548c\u540e\u7eed\u4eff\u771f\u8f93\u51fa\u3002")
+        self.log_output.setObjectName("logOutput")
+
         layout.addWidget(title)
         layout.addWidget(hint)
+        layout.addWidget(self.log_output, 1)
         return card
 
     def _apply_window_style(self) -> None:
         self.setStyleSheet(
             """
             QWidget#mainWrapper {
-                background: #F3F6FB;
+                background: #F5F7FB;
             }
             QWidget#rightWorkspace {
                 background: transparent;
             }
             QFrame#workspaceHero {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #F8FAFC, stop:1 #EEF4FF);
-                border: 1px solid #DCE5F2;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #F8FBFF, stop:1 #F1F5FF);
+                border: 1px solid #E1E7F0;
                 border-radius: 18px;
             }
             QFrame#workspaceCard {
-                background: #F8FAFC;
-                border: 1px solid #E2E8F0;
+                background: #FBFCFE;
+                border: 1px solid #E7EDF5;
                 border-radius: 18px;
+            }
+            QTabWidget#workspaceTabs::pane {
+                border: 1px solid #E4EAF3;
+                border-radius: 18px;
+                background: #FBFCFE;
+                top: -1px;
+            }
+            QTabWidget#workspaceTabs QWidget {
+                background: transparent;
+            }
+            QTabBar::tab {
+                background: #EEF3F9;
+                color: #475569;
+                border: 1px solid transparent;
+                border-radius: 12px;
+                padding: 10px 16px;
+                margin-right: 6px;
+                min-width: 64px;
+                font-weight: 600;
+            }
+            QTabBar::tab:selected {
+                background: #FFFFFF;
+                color: #0F172A;
+                border-color: #D8E2F0;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #E7EEF7;
+                color: #334155;
             }
             QLabel#workspaceEyebrow {
                 color: #64748B;
@@ -521,7 +677,7 @@ class MainWindow(QMainWindow):
             }
             QPlainTextEdit#logOutput {
                 background: #FFFFFF;
-                border: 1px solid #D6DEE8;
+                border: 1px solid #E3EAF4;
                 border-radius: 14px;
                 color: #0F172A;
                 padding: 12px;
@@ -529,7 +685,7 @@ class MainWindow(QMainWindow):
             }
             QStatusBar {
                 background: #F8FAFC;
-                border-top: 1px solid #E2E8F0;
+                border-top: 1px solid #E7EDF5;
                 color: #475569;
             }
             QSplitter#mainSplitter::handle {
@@ -542,4 +698,3 @@ class MainWindow(QMainWindow):
             }
             """
         )
-

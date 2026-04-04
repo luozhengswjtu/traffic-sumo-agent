@@ -2,17 +2,27 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
 from agent.intents import UserIntent
 from agent.memory import PreferenceContextBuilder, SessionMemory
-from agent.prompts import build_system_prompt, build_user_prompt
+from agent.prompts import (
+    ASSISTANT_NAME,
+    build_assistant_system_prompt,
+    build_capability_reply,
+    build_context_system_prompt,
+    build_how_to_reply,
+    build_intro_reply,
+    build_result_system_prompt,
+    build_result_user_prompt,
+)
 from agent.tool_registry import ToolRegistry
-from model_providers.base import ChatMessage
+from model_providers.base import ChatMessage, ToolCall
 from sumo_domain.preferences import ModelConfig, UserPreferences
 from sumo_domain.project_spec import (
     ProjectContext,
@@ -51,6 +61,28 @@ class ParsedCommand(BaseModel):
     project_name: str | None = None
 
 
+@dataclass(slots=True)
+class AssistantProgress:
+    stage: str
+    message: str
+
+
+@dataclass(slots=True)
+class AssistantDecision:
+    mode: str
+    reply_text: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    issues: list[str] = field(default_factory=list)
+    used_model: bool = False
+
+
+@dataclass(slots=True)
+class ToolExecutionSummary:
+    tool_name: str
+    summary: str
+    issues: list[str] = field(default_factory=list)
+
+
 class AgentExecutionResult(BaseModel):
     reply_text: str
     updated_project: ProjectContext | None = None
@@ -61,6 +93,8 @@ class AgentExecutionResult(BaseModel):
     before_state: dict | None = None
     after_state: dict | None = None
     history_record_id: int | None = None
+    response_mode: str = "chat"
+    assistant_name: str = ASSISTANT_NAME
 
 
 class AgentOrchestrator:
@@ -135,19 +169,61 @@ class AgentOrchestrator:
         self.preference_context_builder = PreferenceContextBuilder()
         self._last_model_error: str | None = None
         self._register_tools()
-
-    def handle_user_message(self, text: str, project: ProjectContext | None) -> AgentExecutionResult:
+    def handle_user_message(
+        self,
+        text: str,
+        project: ProjectContext | None,
+        progress_callback: Callable[[AssistantProgress], None] | None = None,
+    ) -> AgentExecutionResult:
         self.memory.append_user_message(text)
         self._last_model_error = None
-        command = self._parse_command(text, project)
-        tool_calls = self._plan_tools(command, project)
-        tool_results = self.execute_tool_plan(tool_calls)
-        result = self._merge_tool_results(command, project, tool_results)
-        history_record = self._record_operation(command, text, project, result)
+        preferences = self.get_user_preferences()
+        context_parts = self._build_context_parts(project, preferences)
+
+        self._emit_progress(progress_callback, "理解中", f"{ASSISTANT_NAME} 正在理解你的需求...")
+        local_reply = self._build_local_chat_reply(text, project, context_parts["project_summary"])
+        if local_reply is not None:
+            result = AgentExecutionResult(
+                reply_text=local_reply,
+                updated_project=project,
+                response_mode="chat",
+                assistant_name=ASSISTANT_NAME,
+            )
+            self.memory.append_agent_message(result.reply_text)
+            return result
+
+        self._emit_progress(progress_callback, "规划中", f"{ASSISTANT_NAME} 正在规划回复和工具...")
+        decision = self._decide_response(text, project, context_parts)
+        if decision.mode == "chat":
+            fallback_command = self._parse_command(text, project)
+            reply_text = decision.reply_text.strip() or self._fallback_reply(fallback_command, project)
+            result = AgentExecutionResult(
+                reply_text=reply_text,
+                updated_project=project,
+                issues=list(decision.issues),
+                response_mode="chat",
+                assistant_name=ASSISTANT_NAME,
+            )
+            self.memory.append_agent_message(result.reply_text)
+            return result
+
+        self._emit_progress(progress_callback, "执行中", f"{ASSISTANT_NAME} 正在执行工具...")
+        tool_summaries, result = self.execute_tool_plan(decision.tool_calls, project)
+        for issue in decision.issues:
+            if issue not in result.issues:
+                result.issues.append(issue)
+
+        self._emit_progress(progress_callback, "整理结果", f"{ASSISTANT_NAME} 正在整理结果...")
+        result.reply_text = self.summarize_result(text, result.updated_project or project, tool_summaries, result.issues)
+        history_command = self._build_history_command(text, project, decision.tool_calls)
+        history_record = self._record_operation(history_command, text, project, result)
         if history_record is not None:
             result.history_record_id = history_record.id
-            if command.intent != UserIntent.VIEW_HISTORY:
-                result.reply_text = f"{result.reply_text}\n\n已记录到操作历史：#{history_record.id}"
+            result.reply_text = f"{result.reply_text}\n\n已记录到操作历史：#{history_record.id}"
+
+        combined_summary = " | ".join(item.summary for item in tool_summaries if item.summary)
+        if combined_summary:
+            self.memory.append_tool_summary(combined_summary)
         self.memory.append_agent_message(result.reply_text)
         return result
 
@@ -176,55 +252,46 @@ class AgentOrchestrator:
         if has_run:
             return UserIntent.RUN_SIMULATION
         return UserIntent.UNKNOWN
+    def execute_tool_plan(
+        self,
+        tool_calls: list[ToolCall],
+        project: ProjectContext | None,
+    ) -> tuple[list[ToolExecutionSummary], AgentExecutionResult]:
+        runtime_project = project
+        merged = AgentExecutionResult(
+            reply_text="",
+            updated_project=project,
+            response_mode="tool",
+            assistant_name=ASSISTANT_NAME,
+        )
+        summaries: list[ToolExecutionSummary] = []
 
-    def execute_tool_plan(self, tool_calls: list[dict]) -> list[dict]:
-        return [self.tool_registry.invoke(tool_call["name"], tool_call["arguments"]) for tool_call in tool_calls]
+        for tool_call in tool_calls:
+            runtime_context: dict[str, Any] = {"project": runtime_project}
+            try:
+                tool_result = self.tool_registry.invoke(tool_call.name, tool_call.arguments, runtime_context)
+            except Exception as exc:
+                message = f"工具 {tool_call.name} 执行失败：{self._format_model_error(str(exc) or exc.__class__.__name__)}"
+                merged.issues.append(message)
+                summaries.append(ToolExecutionSummary(tool_name=tool_call.name, summary=message, issues=[message]))
+                continue
 
-    def summarize_result(self, result: AgentExecutionResult) -> str:
-        return result.reply_text
+            summary_text = tool_result.get("operation_summary") or tool_result.get("reply_text") or f"已执行 {tool_call.name}"
+            issues = [str(item) for item in tool_result.get("issues", [])]
+            summaries.append(ToolExecutionSummary(tool_name=tool_call.name, summary=summary_text, issues=issues))
 
-    def _register_tools(self) -> None:
-        self.tool_registry.register_tool("generate_scenario", "Generate or update a SUMO scenario.", {"name": "generate_scenario"}, self._tool_generate_scenario)
-        self.tool_registry.register_tool("update_preferences", "Update saved user preferences.", {"name": "update_preferences"}, self._tool_update_preferences)
-        self.tool_registry.register_tool("request_run", "Mark current project to run simulation.", {"name": "request_run"}, self._tool_request_run)
-        self.tool_registry.register_tool("summarize_project", "Summarize the current project context.", {"name": "summarize_project"}, self._tool_summarize_project)
-        self.tool_registry.register_tool("show_history", "Show recent project operation history.", {"name": "show_history"}, self._tool_show_history)
-
-    def _plan_tools(self, command: ParsedCommand, project: ProjectContext | None) -> list[dict]:
-        project_payload = project.model_dump(mode="json") if project is not None else None
-        if command.intent in {UserIntent.CREATE_SCENARIO, UserIntent.EDIT_SCENARIO}:
-            return [{"name": "generate_scenario", "arguments": {"command": command.model_dump(mode="json"), "project": project_payload}}]
-        if command.intent == UserIntent.UPDATE_PREFERENCES:
-            return [{"name": "update_preferences", "arguments": {"command": command.model_dump(mode="json")}}]
-        if command.intent == UserIntent.RUN_SIMULATION:
-            return [{"name": "request_run", "arguments": {"command": command.model_dump(mode="json"), "project": project_payload}}]
-        if command.intent == UserIntent.SUMMARIZE_PROJECT:
-            return [{"name": "summarize_project", "arguments": {"project": project_payload}}]
-        if command.intent == UserIntent.VIEW_HISTORY:
-            return [{"name": "show_history", "arguments": {"project": project_payload, "limit": command.history_limit}}]
-        return []
-
-    def _merge_tool_results(self, command: ParsedCommand, project: ProjectContext | None, tool_results: list[dict]) -> AgentExecutionResult:
-        if not tool_results:
-            result = AgentExecutionResult(reply_text=self._fallback_reply(command, project), updated_project=project)
-            if self._last_model_error:
-                result.issues.append(f"模型回退失败：{self._last_model_error}")
-            return result
-
-        merged = AgentExecutionResult(reply_text="", updated_project=project)
-        reply_parts: list[str] = []
-        for tool_result in tool_results:
-            if tool_result.get("reply_text"):
-                reply_parts.append(tool_result["reply_text"])
             updated_project = tool_result.get("updated_project")
             if isinstance(updated_project, dict):
                 merged.updated_project = ProjectContext.model_validate(updated_project)
             elif isinstance(updated_project, ProjectContext):
                 merged.updated_project = updated_project
+
+            if merged.updated_project is not None:
+                runtime_project = merged.updated_project
             if tool_result.get("generated_files"):
                 merged.generated_files.extend(tool_result["generated_files"])
-            if tool_result.get("issues"):
-                merged.issues.extend(tool_result["issues"])
+            if issues:
+                merged.issues.extend(issues)
             if tool_result.get("should_run_simulation"):
                 merged.should_run_simulation = True
             if tool_result.get("operation_summary"):
@@ -234,12 +301,369 @@ class AgentOrchestrator:
             if tool_result.get("after_state") is not None:
                 merged.after_state = tool_result["after_state"]
 
-        merged.reply_text = "\n\n".join(reply_parts) if reply_parts else self._fallback_reply(command, project)
-        return merged
+        return summaries, merged
 
-    def _tool_generate_scenario(self, arguments: dict) -> dict:
-        command = ParsedCommand.model_validate(arguments["command"])
-        project_context = ProjectContext.model_validate(arguments["project"]) if arguments.get("project") else None
+    def summarize_result(
+        self,
+        user_text: str,
+        project: ProjectContext | None,
+        tool_summaries: list[ToolExecutionSummary],
+        issues: list[str],
+    ) -> str:
+        if not tool_summaries:
+            command = self._parse_command(user_text, project)
+            return self._fallback_reply(command, project)
+
+        preferences = self.get_user_preferences()
+        project_summary = self.preference_context_builder.build_project_summary(preferences, project)
+        recent_dialogue = self.memory.recent_dialogue_text()
+        last_tool_summary = " | ".join(item.summary for item in tool_summaries if item.summary)
+        messages = [
+            ChatMessage(role="system", content=build_result_system_prompt(preferences)),
+            ChatMessage(role="system", content=build_context_system_prompt(project_summary, recent_dialogue, last_tool_summary)),
+            ChatMessage(
+                role="user",
+                content=build_result_user_prompt(
+                    user_text,
+                    project_summary,
+                    [item.summary for item in tool_summaries],
+                    issues,
+                ),
+            ),
+        ]
+        try:
+            client = self.model_client_factory.create(self.get_model_config())
+            response = client.chat(messages)
+            if response.text.strip():
+                return response.text.strip()
+        except Exception as exc:
+            issues.append(f"结果整理已回退到本地模板：{self._format_model_error(str(exc) or exc.__class__.__name__)}")
+        return self._fallback_tool_reply(user_text, project, tool_summaries, issues)
+
+    @staticmethod
+    def _emit_progress(
+        progress_callback: Callable[[AssistantProgress], None] | None,
+        stage: str,
+        message: str,
+    ) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(AssistantProgress(stage=stage, message=message))
+
+    def _build_context_parts(self, project: ProjectContext | None, preferences: UserPreferences) -> dict[str, str | None]:
+        project_summary = self.preference_context_builder.build_project_summary(preferences, project)
+        recent_dialogue = self.memory.recent_dialogue_text()
+        last_tool_summary = self.memory.last_tool_summary()
+        return {
+            "project_summary": project_summary,
+            "recent_dialogue": recent_dialogue,
+            "last_tool_summary": last_tool_summary,
+        }
+
+    def _decide_response(
+        self,
+        text: str,
+        project: ProjectContext | None,
+        context_parts: dict[str, str | None],
+    ) -> AssistantDecision:
+        model_decision = self._decide_with_model(text, context_parts)
+        if model_decision is not None:
+            return model_decision
+
+        command = self._parse_command(text, project)
+        tool_calls = self._plan_tools_with_rules(command)
+        issues: list[str] = []
+        if self._last_model_error:
+            issues.append(f"模型规划已回退到本地规则：{self._last_model_error}")
+        if tool_calls:
+            return AssistantDecision(mode="tool", tool_calls=tool_calls, issues=issues)
+        return AssistantDecision(mode="chat", reply_text=self._fallback_reply(command, project), issues=issues)
+
+    def _decide_with_model(
+        self,
+        text: str,
+        context_parts: dict[str, str | None],
+    ) -> AssistantDecision | None:
+        preferences = self.get_user_preferences()
+        messages = [
+            ChatMessage(role="system", content=build_assistant_system_prompt(preferences)),
+            ChatMessage(
+                role="system",
+                content=build_context_system_prompt(
+                    context_parts.get("project_summary"),
+                    context_parts.get("recent_dialogue"),
+                    context_parts.get("last_tool_summary"),
+                ),
+            ),
+            ChatMessage(role="user", content=text),
+        ]
+        try:
+            client = self.model_client_factory.create(self.get_model_config())
+            response = client.chat(messages, tools=self.tool_registry.list_tool_schemas())
+        except Exception as exc:
+            self._last_model_error = self._format_model_error(str(exc) or exc.__class__.__name__)
+            return None
+
+        tool_calls, issues = self._coerce_tool_calls(response.tool_calls)
+        if tool_calls:
+            return AssistantDecision(mode="tool", tool_calls=tool_calls, issues=issues, used_model=True)
+        if response.text.strip():
+            return AssistantDecision(mode="chat", reply_text=response.text.strip(), issues=issues, used_model=True)
+        return None
+    def _coerce_tool_calls(self, tool_calls: list[ToolCall]) -> tuple[list[ToolCall], list[str]]:
+        normalized_calls: list[ToolCall] = []
+        issues: list[str] = []
+        for tool_call in tool_calls:
+            if not self.tool_registry.has_tool(tool_call.name):
+                issues.append(f"已忽略未知工具：{tool_call.name}")
+                continue
+            arguments = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+            normalized_calls.append(
+                ToolCall(name=tool_call.name, arguments=self._normalize_tool_arguments(tool_call.name, arguments))
+            )
+        return normalized_calls, issues
+
+    def _normalize_tool_arguments(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(arguments)
+        bool_keys = {
+            "should_run_simulation",
+            "reset_traffic_bias",
+            "reset_seed",
+            "reset_flow_to_default",
+            "reset_duration_to_default",
+            "reset_step_length_to_default",
+        }
+        for key in bool_keys:
+            value = normalized.get(key)
+            if value is None:
+                normalized.pop(key, None)
+            else:
+                normalized[key] = bool(value)
+
+        if tool_name == "generate_scenario":
+            if normalized.get("speed_limit_kmh") is not None and normalized.get("speed_limit") is None:
+                try:
+                    normalized["speed_limit"] = round(float(normalized["speed_limit_kmh"]) / 3.6, 2)
+                except (TypeError, ValueError):
+                    normalized.pop("speed_limit_kmh", None)
+            elif normalized.get("speed_limit") is not None:
+                try:
+                    speed_limit = float(normalized["speed_limit"])
+                    normalized["speed_limit"] = round(speed_limit / 3.6, 2) if speed_limit > 40 else speed_limit
+                except (TypeError, ValueError):
+                    normalized.pop("speed_limit", None)
+
+            if normalized.get("flow_multiplier") is not None:
+                try:
+                    flow_multiplier = float(normalized["flow_multiplier"])
+                    normalized["flow_multiplier"] = 1.0 + flow_multiplier / 100.0 if flow_multiplier > 5 else flow_multiplier
+                except (TypeError, ValueError):
+                    normalized.pop("flow_multiplier", None)
+
+            for key in ("lane_count", "lane_delta", "duration_seconds", "flow_rate", "seed"):
+                if normalized.get(key) is None:
+                    continue
+                try:
+                    normalized[key] = int(normalized[key])
+                except (TypeError, ValueError):
+                    normalized.pop(key, None)
+
+            for key in ("road_length", "step_length"):
+                if normalized.get(key) is None:
+                    continue
+                try:
+                    normalized[key] = float(normalized[key])
+                except (TypeError, ValueError):
+                    normalized.pop(key, None)
+
+        if tool_name == "show_history" and normalized.get("limit") is not None:
+            try:
+                normalized["limit"] = int(normalized["limit"])
+            except (TypeError, ValueError):
+                normalized.pop("limit", None)
+
+        return {key: value for key, value in normalized.items() if value is not None and value != ""}
+
+    def _build_history_command(
+        self,
+        text: str,
+        project: ProjectContext | None,
+        tool_calls: list[ToolCall],
+    ) -> ParsedCommand:
+        command = self._parse_command(text, project)
+        if command.intent != UserIntent.UNKNOWN:
+            return command
+        for tool_call in tool_calls:
+            if tool_call.name == "generate_scenario":
+                intent = UserIntent.EDIT_SCENARIO if project is not None else UserIntent.CREATE_SCENARIO
+                return ParsedCommand(intent=intent, should_run_simulation=bool(tool_call.arguments.get("should_run_simulation")))
+            if tool_call.name == "update_preferences":
+                return ParsedCommand(intent=UserIntent.UPDATE_PREFERENCES)
+            if tool_call.name == "summarize_project":
+                return ParsedCommand(intent=UserIntent.SUMMARIZE_PROJECT)
+            if tool_call.name == "show_history":
+                return ParsedCommand(intent=UserIntent.VIEW_HISTORY, history_limit=int(tool_call.arguments.get("limit", 5)))
+            if tool_call.name == "request_run":
+                return ParsedCommand(intent=UserIntent.RUN_SIMULATION, should_run_simulation=True)
+        return command
+
+    def _plan_tools_with_rules(self, command: ParsedCommand) -> list[ToolCall]:
+        if command.intent in {UserIntent.CREATE_SCENARIO, UserIntent.EDIT_SCENARIO}:
+            arguments = {
+                key: value
+                for key, value in {
+                    "scenario_type": command.scenario_type,
+                    "lane_count": command.lane_count,
+                    "lane_delta": command.lane_delta,
+                    "road_length": command.road_length,
+                    "speed_limit": command.speed_limit,
+                    "duration_seconds": command.duration_seconds,
+                    "step_length": command.step_length,
+                    "flow_level": command.flow_level,
+                    "flow_rate": command.flow_rate,
+                    "flow_multiplier": command.flow_multiplier,
+                    "traffic_bias": command.traffic_bias,
+                    "seed": command.seed,
+                    "reset_traffic_bias": command.reset_traffic_bias,
+                    "reset_seed": command.reset_seed,
+                    "reset_flow_to_default": command.reset_flow_to_default,
+                    "reset_duration_to_default": command.reset_duration_to_default,
+                    "reset_step_length_to_default": command.reset_step_length_to_default,
+                    "should_run_simulation": command.should_run_simulation,
+                    "project_name": command.project_name,
+                }.items()
+                if value not in (None, False, "")
+            }
+            return [ToolCall(name="generate_scenario", arguments=arguments)]
+        if command.intent == UserIntent.UPDATE_PREFERENCES and command.preference_updates:
+            return [ToolCall(name="update_preferences", arguments=dict(command.preference_updates))]
+        if command.intent == UserIntent.RUN_SIMULATION:
+            return [ToolCall(name="request_run", arguments={})]
+        if command.intent == UserIntent.SUMMARIZE_PROJECT:
+            return [ToolCall(name="summarize_project", arguments={})]
+        if command.intent == UserIntent.VIEW_HISTORY:
+            return [ToolCall(name="show_history", arguments={"limit": command.history_limit})]
+        return []
+
+    def _register_tools(self) -> None:
+        self.tool_registry.register_tool(
+            "generate_scenario",
+            "生成或更新当前 SUMO 场景，可同时修改场景类型、车道、长度、限速、流量、时长、步长，并可在完成后直接运行。",
+            {
+                "type": "object",
+                "properties": {
+                    "scenario_type": {"type": "string", "enum": ["intersection", "t_junction", "corridor"]},
+                    "lane_count": {"type": "integer", "minimum": 1},
+                    "lane_delta": {"type": "integer"},
+                    "road_length": {"type": "number", "minimum": 20},
+                    "speed_limit_kmh": {"type": "number", "minimum": 5},
+                    "speed_limit": {"type": "number", "minimum": 1},
+                    "duration_seconds": {"type": "integer", "minimum": 30},
+                    "step_length": {"type": "number", "minimum": 0.1},
+                    "flow_level": {"type": "string", "enum": ["low", "medium", "high", "very_high"]},
+                    "flow_rate": {"type": "integer", "minimum": 1},
+                    "flow_multiplier": {"type": "number", "minimum": 0.05},
+                    "traffic_bias": {"type": "string", "enum": ["north_south", "east_west"]},
+                    "seed": {"type": "integer", "minimum": 0},
+                    "reset_traffic_bias": {"type": "boolean"},
+                    "reset_seed": {"type": "boolean"},
+                    "reset_flow_to_default": {"type": "boolean"},
+                    "reset_duration_to_default": {"type": "boolean"},
+                    "reset_step_length_to_default": {"type": "boolean"},
+                    "should_run_simulation": {"type": "boolean"},
+                    "project_name": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+            self._tool_generate_scenario,
+        )
+        self.tool_registry.register_tool(
+            "update_preferences",
+            "更新用户默认偏好，包括默认场景、默认流量和默认仿真时长。",
+            {
+                "type": "object",
+                "properties": {
+                    "default_scenario_type": {"type": "string", "enum": ["intersection", "t_junction", "corridor"]},
+                    "default_flow_level": {"type": "string", "enum": ["low", "medium", "high", "very_high"]},
+                    "default_duration": {"type": "integer", "minimum": 30},
+                    "system_prompt_additions": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+            self._tool_update_preferences,
+        )
+        self.tool_registry.register_tool(
+            "request_run",
+            "请求运行当前项目的仿真。",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            self._tool_request_run,
+        )
+        self.tool_registry.register_tool(
+            "summarize_project",
+            "查看当前项目摘要。",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            self._tool_summarize_project,
+        )
+        self.tool_registry.register_tool(
+            "show_history",
+            "查看最近的操作历史。",
+            {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                },
+                "additionalProperties": False,
+            },
+            self._tool_show_history,
+        )
+    def _build_local_chat_reply(
+        self,
+        text: str,
+        project: ProjectContext | None,
+        project_summary: str | None,
+    ) -> str | None:
+        lowered = text.lower().strip()
+        if any(token in text for token in ("介绍你自己", "自我介绍", "你是谁", "你叫什么")):
+            return build_intro_reply(project_summary)
+        if any(token in text for token in ("你能做什么", "有什么用", "可以做什么", "能帮我做什么")):
+            return build_capability_reply(project_summary)
+        if any(token in text for token in ("怎么用", "怎么生成", "如何生成", "怎么创建", "给我个示例", "给我几个例子", "怎么操作")) or lowered in {"help", "usage"}:
+            return build_how_to_reply(project_summary)
+        if any(token in text for token in ("当前项目", "当前场景", "项目摘要", "现在是什么场景", "项目是什么")):
+            if project is None:
+                return "当前还没有打开项目。你可以先让我生成一个场景，或者先新建并加载项目。"
+            state = self._derive_scenario_state(project, self.get_user_preferences())
+            return self._format_project_summary(project, state)
+        return None
+
+    def _tool_generate_scenario(self, arguments: dict, runtime_context: dict[str, Any] | None = None) -> dict:
+        project_context = None
+        if runtime_context and runtime_context.get("project") is not None:
+            runtime_project = runtime_context["project"]
+            project_context = runtime_project if isinstance(runtime_project, ProjectContext) else ProjectContext.model_validate(runtime_project)
+
+        command = ParsedCommand(
+            intent=UserIntent.EDIT_SCENARIO if project_context is not None else UserIntent.CREATE_SCENARIO,
+            scenario_type=arguments.get("scenario_type"),
+            lane_count=arguments.get("lane_count"),
+            lane_delta=arguments.get("lane_delta"),
+            road_length=arguments.get("road_length"),
+            speed_limit=arguments.get("speed_limit"),
+            duration_seconds=arguments.get("duration_seconds"),
+            step_length=arguments.get("step_length"),
+            flow_level=arguments.get("flow_level"),
+            flow_rate=arguments.get("flow_rate"),
+            flow_multiplier=arguments.get("flow_multiplier"),
+            traffic_bias=arguments.get("traffic_bias"),
+            seed=arguments.get("seed"),
+            reset_traffic_bias=bool(arguments.get("reset_traffic_bias", False)),
+            reset_seed=bool(arguments.get("reset_seed", False)),
+            reset_flow_to_default=bool(arguments.get("reset_flow_to_default", False)),
+            reset_duration_to_default=bool(arguments.get("reset_duration_to_default", False)),
+            reset_step_length_to_default=bool(arguments.get("reset_step_length_to_default", False)),
+            should_run_simulation=bool(arguments.get("should_run_simulation", False)),
+            project_name=arguments.get("project_name"),
+        )
 
         preferences = self.get_user_preferences()
         meta = project_context.meta if project_context else self._create_default_project_meta(command)
@@ -248,8 +672,8 @@ class AgentOrchestrator:
 
         if command.intent == UserIntent.EDIT_SCENARIO and not self._has_edit_payload(command):
             message = (
-                "已识别为修改请求，但没有识别到具体参数。\n"
-                "可用示例：5车道、车道改为5、流量提高30%、流量改成1500、增加流量、减少流量。"
+                "我已经识别到你想修改场景，但当前缺少明确参数。\n"
+                "你可以直接说：车道改为 5、流量提高 30%、时长改成 1200 秒。"
             )
             return {
                 "reply_text": message,
@@ -261,7 +685,6 @@ class AgentOrchestrator:
             }
 
         next_state = self._apply_command_to_state(base_state, command, preferences)
-
         network = self.network_generator.generate(
             NetworkGenerationRequest(
                 scenario_type=next_state.scenario_type,
@@ -287,8 +710,13 @@ class AgentOrchestrator:
                 seed=next_state.seed,
             ),
         )
-
-        updated_context = ProjectContext(meta=meta, network=network, routes=routes, simulation=simulation, scenario_state=next_state)
+        updated_context = ProjectContext(
+            meta=meta,
+            network=network,
+            routes=routes,
+            simulation=simulation,
+            scenario_state=next_state,
+        )
         build_result = self.project_builder.build_project(updated_context)
         issue_texts = [f"{issue.level}: {issue.message}" for issue in build_result.issues]
         has_build_errors = any(issue.level == "error" for issue in build_result.issues)
@@ -307,7 +735,7 @@ class AgentOrchestrator:
         if issue_texts:
             detail_summary += " 注意：" + "；".join(issue_texts)
 
-        reply_prefix = "场景构建失败" if has_build_errors else "变更确认"
+        reply_prefix = "场景构建失败" if has_build_errors else "场景已更新"
         reply_text = f"{reply_prefix}：\n{operation_summary}\n\n{detail_summary}"
         return {
             "reply_text": reply_text,
@@ -320,30 +748,36 @@ class AgentOrchestrator:
             "after_state": next_state.model_dump(mode="json"),
         }
 
-    def _tool_update_preferences(self, arguments: dict) -> dict:
-        command = ParsedCommand.model_validate(arguments["command"])
+    def _tool_update_preferences(self, arguments: dict, runtime_context: dict[str, Any] | None = None) -> dict:
         current = self.get_user_preferences()
-        updates = {key: value for key, value in command.preference_updates.items() if value is not None}
+        updates = {
+            key: value
+            for key, value in arguments.items()
+            if key in {"default_scenario_type", "default_flow_level", "default_duration", "system_prompt_additions"}
+            and value is not None
+        }
         if not updates:
             return {
-                "reply_text": "没有识别到可更新的偏好字段。支持默认场景、默认流量、默认时长。",
+                "reply_text": "这次没有识别到可更新的偏好字段。支持默认场景、默认流量、默认时长和额外提示词。",
                 "issues": [],
             }
 
         updated = current.model_copy(update=updates)
         self.config_store.save_user_preferences(updated)
         self.set_user_preferences(updated)
-
         confirmation_lines = [f"- {key}: {getattr(current, key)} -> {value}" for key, value in updates.items()]
         operation_summary = "\n".join(confirmation_lines)
         return {
-            "reply_text": f"偏好更新确认：\n{operation_summary}",
+            "reply_text": f"偏好已更新：\n{operation_summary}",
             "issues": [],
             "operation_summary": operation_summary,
         }
 
-    def _tool_request_run(self, arguments: dict) -> dict:
-        project_context = ProjectContext.model_validate(arguments["project"]) if arguments.get("project") else None
+    def _tool_request_run(self, arguments: dict, runtime_context: dict[str, Any] | None = None) -> dict:
+        project_context = None
+        if runtime_context and runtime_context.get("project") is not None:
+            runtime_project = runtime_context["project"]
+            project_context = runtime_project if isinstance(runtime_project, ProjectContext) else ProjectContext.model_validate(runtime_project)
         if project_context is None:
             return {
                 "reply_text": "当前没有项目上下文。请先生成场景或创建项目后再运行。",
@@ -360,10 +794,13 @@ class AgentOrchestrator:
             "after_state": project_context.scenario_state.model_dump(mode="json") if project_context.scenario_state else None,
         }
 
-    def _tool_summarize_project(self, arguments: dict) -> dict:
-        if not arguments.get("project"):
+    def _tool_summarize_project(self, arguments: dict, runtime_context: dict[str, Any] | None = None) -> dict:
+        project = None
+        if runtime_context and runtime_context.get("project") is not None:
+            runtime_project = runtime_context["project"]
+            project = runtime_project if isinstance(runtime_project, ProjectContext) else ProjectContext.model_validate(runtime_project)
+        if project is None:
             return {"reply_text": "当前没有项目上下文。请先生成场景或创建项目。", "issues": []}
-        project = ProjectContext.model_validate(arguments["project"])
         state = self._derive_scenario_state(project, self.get_user_preferences())
         operation_summary = f"查看项目摘要：{project.meta.name}"
         return {
@@ -375,8 +812,11 @@ class AgentOrchestrator:
             "after_state": state.model_dump(mode="json"),
         }
 
-    def _tool_show_history(self, arguments: dict) -> dict:
-        project = ProjectContext.model_validate(arguments["project"]) if arguments.get("project") else None
+    def _tool_show_history(self, arguments: dict, runtime_context: dict[str, Any] | None = None) -> dict:
+        project = None
+        if runtime_context and runtime_context.get("project") is not None:
+            runtime_project = runtime_context["project"]
+            project = runtime_project if isinstance(runtime_project, ProjectContext) else ProjectContext.model_validate(runtime_project)
         limit = int(arguments.get("limit", 5))
         records = self.history_store.list_recent(project_dir=project.meta.project_dir if project else None, limit=limit)
         if not records:
@@ -392,8 +832,7 @@ class AgentOrchestrator:
             lines.append(f"{index}. [{created_at}] {record.intent}")
             lines.append(f"用户消息：{record.user_message}")
             lines.append(f"变更摘要：{record.change_summary}")
-        return {"reply_text": "\n".join(lines), "issues": []}
-
+        return {"reply_text": "\n".join(lines), "issues": [], "operation_summary": title}
     def _derive_scenario_state(self, project: ProjectContext, preferences: UserPreferences) -> ProjectScenarioState:
         if project.scenario_state is not None:
             return project.scenario_state
@@ -473,46 +912,10 @@ class AgentOrchestrator:
         self.recent_store.add_recent_project(RecentProjectItem(name=meta.name, project_dir=str(meta.project_dir), last_opened_at=datetime.now()))
         return meta
     def _parse_command(self, text: str, project: ProjectContext | None) -> ParsedCommand:
-        command = self._parse_with_rules(text)
-        if self._should_try_model_fallback(command):
-            model_command = self._parse_with_model(text, project)
-            if model_command is not None:
-                command = model_command
-        return command
+        return self._parse_with_rules(text)
 
     def _parse_with_model(self, text: str, project: ProjectContext | None) -> ParsedCommand | None:
-        config = self.get_model_config()
-        if not config.api_key:
-            return None
-        try:
-            client = self.model_client_factory.create(config)
-            project_summary = self.preference_context_builder.build_system_context(self.get_user_preferences(), project)
-            response = client.chat(
-                [
-                    ChatMessage(role="system", content=build_system_prompt(self.get_user_preferences())),
-                    ChatMessage(role="user", content=build_user_prompt(text, project_summary)),
-                ]
-            )
-            payload = self._extract_json_object(response.text)
-            if payload is None:
-                self._last_model_error = "模型已响应，但返回内容里没有可解析的 JSON。"
-                return None
-            intent_value = payload.get("intent")
-            if not isinstance(intent_value, str) or intent_value not in {item.value for item in UserIntent}:
-                payload["intent"] = UserIntent.UNKNOWN.value
-            if payload.get("should_run_simulation") is None:
-                payload["should_run_simulation"] = False
-            if not isinstance(payload.get("preference_updates"), dict):
-                payload["preference_updates"] = {}
-            parsed = ParsedCommand.model_validate(payload)
-            if parsed.intent == UserIntent.UNKNOWN:
-                parsed.intent = self.detect_intent(text)
-            self._last_model_error = None
-            return parsed
-        except Exception as exc:
-            self._last_model_error = self._format_model_error(str(exc) or exc.__class__.__name__)
-            return None
-
+        return None
     def _parse_with_rules(self, text: str) -> ParsedCommand:
         command = ParsedCommand(intent=self.detect_intent(text))
 
@@ -725,23 +1128,359 @@ class AgentOrchestrator:
         except json.JSONDecodeError:
             return None
 
+    def handle_user_message(
+        self,
+        text: str,
+        project: ProjectContext | None,
+        progress_callback: Callable[[AssistantProgress], None] | None = None,
+    ) -> AgentExecutionResult:
+        self.memory.append_user_message(text)
+        self._last_model_error = None
+        preferences = self.get_user_preferences()
+        context_parts = self._build_context_parts(project, preferences)
+
+        self._emit_progress(progress_callback, "理解中", f"{ASSISTANT_NAME} 正在理解你的需求...")
+        local_reply = self._build_local_chat_reply(text, project, context_parts["project_summary"])
+        if local_reply is not None:
+            result = AgentExecutionResult(
+                reply_text=local_reply,
+                updated_project=project,
+                response_mode="chat",
+                assistant_name=ASSISTANT_NAME,
+            )
+            self.memory.append_agent_message(result.reply_text)
+            return result
+
+        self._emit_progress(progress_callback, "规划中", f"{ASSISTANT_NAME} 正在规划回复和工具...")
+        decision = self._decide_response(text, project, context_parts)
+        if decision.mode == "chat":
+            fallback_command = self._parse_command(text, project)
+            reply_text = decision.reply_text.strip() or self._fallback_reply(fallback_command, project)
+            result = AgentExecutionResult(
+                reply_text=reply_text,
+                updated_project=project,
+                issues=list(decision.issues),
+                response_mode="chat",
+                assistant_name=ASSISTANT_NAME,
+            )
+            self.memory.append_agent_message(result.reply_text)
+            return result
+
+        self._emit_progress(progress_callback, "执行中", f"{ASSISTANT_NAME} 正在执行工具...")
+        tool_summaries, result = self.execute_tool_plan(decision.tool_calls, project)
+        for issue in decision.issues:
+            if issue not in result.issues:
+                result.issues.append(issue)
+
+        self._emit_progress(progress_callback, "整理结果", f"{ASSISTANT_NAME} 正在整理结果...")
+        result.reply_text = self.summarize_result(text, result.updated_project or project, tool_summaries, result.issues)
+        history_command = self._build_history_command(text, project, decision.tool_calls)
+        history_record = self._record_operation(history_command, text, project, result)
+        if history_record is not None:
+            result.history_record_id = history_record.id
+            result.reply_text = chr(10).join([result.reply_text, "", f"已记录到操作历史：#{history_record.id}"])
+
+        combined_summary = " | ".join(item.summary for item in tool_summaries if item.summary)
+        if combined_summary:
+            self.memory.append_tool_summary(combined_summary)
+        self.memory.append_agent_message(result.reply_text)
+        return result
+
+    def detect_intent(self, text: str) -> UserIntent:
+        lowered = text.lower()
+        has_edit = any(token in text for token in ("改成", "修改", "调整", "提高", "增加", "降低", "减少", "设为", "取消", "清空", "恢复默认", "去掉"))
+        has_scenario = any(token in text for token in ("生成", "创建", "新建", "十字", "T字", "t字", "丁字", "路口", "路段"))
+        has_param = any(token in text for token in ("流量", "步长", "时长", "车道", "限速", "速度", "seed", "种子", "长度", "偏向", "南北", "东西"))
+        has_run = any(token in text for token in ("运行", "启动", "跑", "开始仿真")) or "run" in lowered
+        has_summary = any(token in text for token in ("当前项目", "项目情况", "当前场景", "场景摘要", "总结当前", "现在是什么场景", "看下当前"))
+        has_history = any(token in text for token in ("操作历史", "最近变更", "查看历史", "历史记录", "最近操作", "追溯记录"))
+        has_pref_words = any(token in text for token in ("偏好", "默认场景", "默认流量", "默认时长", "习惯"))
+
+        if has_history:
+            return UserIntent.VIEW_HISTORY
+        if has_summary and not (has_edit or has_run or has_scenario):
+            return UserIntent.SUMMARIZE_PROJECT
+        if has_pref_words and not has_edit:
+            return UserIntent.UPDATE_PREFERENCES
+        if has_edit and (has_param or has_scenario):
+            return UserIntent.EDIT_SCENARIO
+        if has_scenario:
+            return UserIntent.CREATE_SCENARIO
+        if has_param:
+            return UserIntent.EDIT_SCENARIO
+        if has_run:
+            return UserIntent.RUN_SIMULATION
+        return UserIntent.UNKNOWN
+
+    def _build_local_chat_reply(
+        self,
+        text: str,
+        project: ProjectContext | None,
+        project_summary: str | None,
+    ) -> str | None:
+        lowered = text.lower().strip()
+        if any(token in text for token in ("介绍你自己", "自我介绍", "你是谁", "你叫什么")):
+            return build_intro_reply(project_summary)
+        if any(token in text for token in ("你能做什么", "有什么用", "可以做什么", "能帮我做什么")):
+            return build_capability_reply(project_summary)
+        if any(token in text for token in ("怎么用", "怎么生成", "如何生成", "怎么创建", "给我个示例", "给我几个例子", "怎么操作")) or lowered in {"help", "usage"}:
+            return build_how_to_reply(project_summary)
+        if any(token in text for token in ("当前项目", "当前场景", "项目摘要", "现在是什么场景", "项目是什么")):
+            if project is None:
+                return "当前还没有打开项目。你可以先让我生成一个场景，或者先新建并加载项目。"
+            state = self._derive_scenario_state(project, self.get_user_preferences())
+            return self._format_project_summary(project, state)
+        return None
+    def _tool_generate_scenario(self, arguments: dict, runtime_context: dict[str, Any] | None = None) -> dict:
+        project_context = None
+        if runtime_context and runtime_context.get("project") is not None:
+            runtime_project = runtime_context["project"]
+            project_context = runtime_project if isinstance(runtime_project, ProjectContext) else ProjectContext.model_validate(runtime_project)
+
+        command = ParsedCommand(
+            intent=UserIntent.EDIT_SCENARIO if project_context is not None else UserIntent.CREATE_SCENARIO,
+            scenario_type=arguments.get("scenario_type"),
+            lane_count=arguments.get("lane_count"),
+            lane_delta=arguments.get("lane_delta"),
+            road_length=arguments.get("road_length"),
+            speed_limit=arguments.get("speed_limit"),
+            duration_seconds=arguments.get("duration_seconds"),
+            step_length=arguments.get("step_length"),
+            flow_level=arguments.get("flow_level"),
+            flow_rate=arguments.get("flow_rate"),
+            flow_multiplier=arguments.get("flow_multiplier"),
+            traffic_bias=arguments.get("traffic_bias"),
+            seed=arguments.get("seed"),
+            reset_traffic_bias=bool(arguments.get("reset_traffic_bias", False)),
+            reset_seed=bool(arguments.get("reset_seed", False)),
+            reset_flow_to_default=bool(arguments.get("reset_flow_to_default", False)),
+            reset_duration_to_default=bool(arguments.get("reset_duration_to_default", False)),
+            reset_step_length_to_default=bool(arguments.get("reset_step_length_to_default", False)),
+            should_run_simulation=bool(arguments.get("should_run_simulation", False)),
+            project_name=arguments.get("project_name"),
+        )
+
+        preferences = self.get_user_preferences()
+        meta = project_context.meta if project_context else self._create_default_project_meta(command)
+        base_context = project_context or ProjectContext(meta=meta)
+        base_state = self._derive_scenario_state(base_context, preferences)
+
+        if command.intent == UserIntent.EDIT_SCENARIO and not self._has_edit_payload(command):
+            message = chr(10).join(
+                [
+                    "我已经识别到你想修改场景，但当前缺少明确参数。",
+                    "你可以直接说：车道改为 5、流量提高 30%、时长改成 1200 秒。",
+                ]
+            )
+            return {
+                "reply_text": message,
+                "updated_project": project_context.model_dump(mode="json") if project_context else None,
+                "issues": ["未识别到可执行的修改参数。"],
+                "operation_summary": "编辑失败：未识别到具体参数。",
+                "before_state": base_state.model_dump(mode="json"),
+                "after_state": base_state.model_dump(mode="json"),
+            }
+
+        next_state = self._apply_command_to_state(base_state, command, preferences)
+        network = self.network_generator.generate(
+            NetworkGenerationRequest(
+                scenario_type=next_state.scenario_type,
+                lane_count=next_state.lane_count,
+                road_length=next_state.road_length,
+                speed_limit=next_state.speed_limit,
+            )
+        )
+        routes = self.route_generator.generate_routes(
+            network,
+            RouteGenerationRequest(
+                flow_level=next_state.flow_level,
+                flow_rate=next_state.flow_rate,
+                duration_seconds=next_state.duration_seconds,
+                traffic_bias=next_state.traffic_bias,
+            ),
+        )
+        simulation = self.config_generator.build_simulation_spec(
+            Path(meta.project_dir),
+            SimulationConfigRequest(
+                duration_seconds=next_state.duration_seconds,
+                step_length=next_state.step_length,
+                seed=next_state.seed,
+            ),
+        )
+        updated_context = ProjectContext(
+            meta=meta,
+            network=network,
+            routes=routes,
+            simulation=simulation,
+            scenario_state=next_state,
+        )
+        build_result = self.project_builder.build_project(updated_context)
+        issue_texts = [f"{issue.level}: {issue.message}" for issue in build_result.issues]
+        has_build_errors = any(issue.level == "error" for issue in build_result.issues)
+
+        operation_summary = self._build_state_change_summary(base_state if project_context else None, next_state)
+        detail_summary = (
+            f"当前目标场景：{self._label_scenario(next_state.scenario_type)}，"
+            f"车道数={next_state.lane_count}，长度={int(round(next_state.road_length))}m，"
+            f"限速={self._format_speed_limit(next_state.speed_limit)}，流量={self._describe_flow(next_state)}，"
+            f"时长={next_state.duration_seconds}s，步长={next_state.step_length}。"
+        )
+        if next_state.traffic_bias:
+            detail_summary += f" 偏向={self.BIAS_LABELS.get(next_state.traffic_bias, next_state.traffic_bias)}。"
+        if command.should_run_simulation and not has_build_errors:
+            detail_summary += " 构建完成后将直接运行仿真。"
+        if issue_texts:
+            detail_summary += " 注意：" + "；".join(issue_texts)
+
+        reply_prefix = "场景构建失败" if has_build_errors else "场景已更新"
+        reply_text = chr(10).join([f"{reply_prefix}：", operation_summary, "", detail_summary])
+        return {
+            "reply_text": reply_text,
+            "updated_project": updated_context.model_dump(mode="json"),
+            "generated_files": [str(path) for path in build_result.generated_files],
+            "issues": issue_texts,
+            "should_run_simulation": command.should_run_simulation and not has_build_errors,
+            "operation_summary": operation_summary,
+            "before_state": base_state.model_dump(mode="json") if project_context else None,
+            "after_state": next_state.model_dump(mode="json"),
+        }
+
+    def _tool_update_preferences(self, arguments: dict, runtime_context: dict[str, Any] | None = None) -> dict:
+        current = self.get_user_preferences()
+        updates = {
+            key: value
+            for key, value in arguments.items()
+            if key in {"default_scenario_type", "default_flow_level", "default_duration", "system_prompt_additions"}
+            and value is not None
+        }
+        if not updates:
+            return {
+                "reply_text": "这次没有识别到可更新的偏好字段。支持默认场景、默认流量、默认时长和额外提示词。",
+                "issues": [],
+            }
+
+        updated = current.model_copy(update=updates)
+        self.config_store.save_user_preferences(updated)
+        self.set_user_preferences(updated)
+        confirmation_lines = [f"- {key}: {getattr(current, key)} -> {value}" for key, value in updates.items()]
+        operation_summary = chr(10).join(confirmation_lines)
+        return {
+            "reply_text": chr(10).join(["偏好已更新：", operation_summary]),
+            "issues": [],
+            "operation_summary": operation_summary,
+        }
+    def _tool_request_run(self, arguments: dict, runtime_context: dict[str, Any] | None = None) -> dict:
+        project_context = None
+        if runtime_context and runtime_context.get("project") is not None:
+            runtime_project = runtime_context["project"]
+            project_context = runtime_project if isinstance(runtime_project, ProjectContext) else ProjectContext.model_validate(runtime_project)
+        if project_context is None:
+            return {
+                "reply_text": "当前没有项目上下文。请先生成场景或创建项目后再运行。",
+                "issues": [],
+                "operation_summary": "运行请求失败：缺少项目上下文。",
+            }
+        operation_summary = f"请求运行项目 {project_context.meta.name}。"
+        return {
+            "reply_text": chr(10).join(["运行确认：", f"- 当前项目：{project_context.meta.name}", "- 状态：已接受运行请求"]),
+            "should_run_simulation": True,
+            "issues": [],
+            "operation_summary": operation_summary,
+            "before_state": project_context.scenario_state.model_dump(mode="json") if project_context.scenario_state else None,
+            "after_state": project_context.scenario_state.model_dump(mode="json") if project_context.scenario_state else None,
+        }
+
+    def _tool_summarize_project(self, arguments: dict, runtime_context: dict[str, Any] | None = None) -> dict:
+        project = None
+        if runtime_context and runtime_context.get("project") is not None:
+            runtime_project = runtime_context["project"]
+            project = runtime_project if isinstance(runtime_project, ProjectContext) else ProjectContext.model_validate(runtime_project)
+        if project is None:
+            return {"reply_text": "当前没有项目上下文。请先生成场景或创建项目。", "issues": []}
+        state = self._derive_scenario_state(project, self.get_user_preferences())
+        operation_summary = f"查看项目摘要：{project.meta.name}"
+        return {
+            "reply_text": self._format_project_summary(project, state),
+            "updated_project": project.model_dump(mode="json"),
+            "issues": [],
+            "operation_summary": operation_summary,
+            "before_state": state.model_dump(mode="json"),
+            "after_state": state.model_dump(mode="json"),
+        }
+
+    def _tool_show_history(self, arguments: dict, runtime_context: dict[str, Any] | None = None) -> dict:
+        project = None
+        if runtime_context and runtime_context.get("project") is not None:
+            runtime_project = runtime_context["project"]
+            project = runtime_project if isinstance(runtime_project, ProjectContext) else ProjectContext.model_validate(runtime_project)
+        limit = int(arguments.get("limit", 5))
+        records = self.history_store.list_recent(project_dir=project.meta.project_dir if project else None, limit=limit)
+        if not records:
+            return {"reply_text": "当前还没有可追溯的操作历史。", "issues": []}
+
+        lines: list[str] = []
+        title = f"最近 {len(records)} 条操作历史"
+        if project is not None:
+            title += f"（项目：{project.meta.name}）"
+        lines.append(title)
+        for index, record in enumerate(records, start=1):
+            created_at = record.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            lines.append(f"{index}. [{created_at}] {record.intent}")
+            lines.append(f"用户消息：{record.user_message}")
+            lines.append(f"变更摘要：{record.change_summary}")
+        return {"reply_text": chr(10).join(lines), "issues": [], "operation_summary": title}
+
     def _fallback_reply(self, command: ParsedCommand, project: ProjectContext | None) -> str:
         if command.intent == UserIntent.RUN_SIMULATION:
             if project is None:
-                return "\u5f53\u524d\u6ca1\u6709\u9879\u76ee\u4e0a\u4e0b\u6587\u3002\u8bf7\u5148\u751f\u6210\u573a\u666f\uff0c\u6216\u5148\u65b0\u5efa\u9879\u76ee\u540e\u518d\u8fd0\u884c\u3002"
-            return "\u5df2\u8bc6\u522b\u4e3a\u8fd0\u884c\u8bf7\u6c42\u3002"
+                return "当前没有项目上下文。请先生成场景，或先新建项目后再运行。"
+            return f"已收到运行请求，当前项目是 {project.meta.name}。"
         if command.intent == UserIntent.SUMMARIZE_PROJECT:
             if project is None:
-                return "\u5f53\u524d\u6ca1\u6709\u9879\u76ee\u4e0a\u4e0b\u6587\u3002\u8bf7\u5148\u751f\u6210\u573a\u666f\u6216\u521b\u5efa\u9879\u76ee\u3002"
+                return "当前没有项目上下文。请先生成场景或创建项目。"
             return self._format_project_summary(project, self._derive_scenario_state(project, self.get_user_preferences()))
         if command.intent == UserIntent.VIEW_HISTORY:
-            return "\u5f53\u524d\u6ca1\u6709\u53ef\u5c55\u793a\u7684\u5386\u53f2\u8bb0\u5f55\u3002"
-        if command.intent == UserIntent.UNKNOWN:
-            message = "\u672a\u8bc6\u522b\u51fa\u660e\u786e\u64cd\u4f5c\u3002TrafficAgent \u5f53\u524d\u662f\u547d\u4ee4\u5f0f\u4ee3\u7406\uff0c\u4e0d\u652f\u6301\u95f2\u804a\u3001\u81ea\u6211\u4ecb\u7ecd\u6216\u5f00\u653e\u5f0f\u95ee\u7b54\u3002\u5f53\u524d\u652f\u6301\uff1a\u751f\u6210\u573a\u666f\u3001\u4fee\u6539\u8f66\u9053/\u6d41\u91cf/\u6b65\u957f/\u65f6\u957f/\u9650\u901f/\u957f\u5ea6\u3001\u67e5\u8be2\u5f53\u524d\u9879\u76ee\u6458\u8981\u3001\u67e5\u770b\u6700\u8fd1\u64cd\u4f5c\u5386\u53f2\u3001\u66f4\u65b0\u9ed8\u8ba4\u504f\u597d\u3001\u8fd0\u884c\u4eff\u771f\u3002"
-            if self._last_model_error:
-                return f"{message}\n\n\u6a21\u578b\u56de\u9000\u5931\u8d25\uff1a{self._last_model_error}"
-            return message
-        return "\u8bf7\u6c42\u5df2\u5904\u7406\u3002"
+            return "你可以直接说“看看最近 5 条历史”或“查看操作历史”，我会帮你整理最近的项目变更。"
+        if command.intent == UserIntent.UPDATE_PREFERENCES:
+            return "你可以直接说“以后默认场景用十字路口”或“默认时长改成 1200 秒”，我会帮你更新偏好。"
+        if command.intent in {UserIntent.CREATE_SCENARIO, UserIntent.EDIT_SCENARIO} and not self._has_edit_payload(command):
+            return "我已经识别到你在描述场景，但还缺少可执行参数。你可以补一句：车道改为 4、流量提高 30%、仿真 1800 秒。"
+        if project is not None:
+            return chr(10).join(
+                [
+                    f"我是 {ASSISTANT_NAME}，主要负责 TrafficAgent 里的场景生成、参数调整、项目摘要、历史查询和仿真运行。",
+                    "",
+                    "当前项目概览：",
+                    self._format_project_summary(project, self._derive_scenario_state(project, self.get_user_preferences())),
+                ]
+            )
+        return (
+            f"我是 {ASSISTANT_NAME}，主要负责 TrafficAgent 里的场景生成、参数调整、项目摘要、历史查询和仿真运行。"
+            "你可以直接告诉我你想做什么，例如：生成一个双向四车道十字路口，仿真 1800 秒。"
+        )
+
+    def _fallback_tool_reply(
+        self,
+        user_text: str,
+        project: ProjectContext | None,
+        tool_summaries: list[ToolExecutionSummary],
+        issues: list[str],
+    ) -> str:
+        lines = [f"我理解你的意思是：{user_text}", "本轮我已经完成这些动作："]
+        lines.extend(f"- {item.summary}" for item in tool_summaries if item.summary)
+        if project is not None:
+            lines.extend(
+                [
+                    "",
+                    "当前项目状态：",
+                    self._format_project_summary(project, self._derive_scenario_state(project, self.get_user_preferences())),
+                ]
+            )
+        if issues:
+            lines.append("")
+            lines.append("需要注意：")
+            lines.extend(f"- {item}" for item in issues)
+        return chr(10).join(lines)
 
     @staticmethod
     def _format_model_error(message: str) -> str:
@@ -749,7 +1488,6 @@ class AgentOrchestrator:
         if len(compact) <= 240:
             return compact
         return f"{compact[:237]}..."
-
     def _infer_flow_level(self, flow_rate: int) -> str:
         if flow_rate < 450:
             return "low"
