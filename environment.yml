@@ -1,0 +1,8 @@
+name: traffic-agent
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pyside6>=6.7,<7
+  - pydantic>=2,<3
+  - pip
