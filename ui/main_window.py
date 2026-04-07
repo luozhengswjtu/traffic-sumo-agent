@@ -10,10 +10,12 @@ from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QPushButton,
     QSplitter,
     QStatusBar,
     QTabWidget,
@@ -69,6 +71,7 @@ class MainWindow(QMainWindow):
         self._task_kind: str | None = None
         self._close_after_task = False
         self._pending_image_draft: IntersectionImageDraft | None = None
+        self._model_summary_label: QLabel | None = None
         self.setWindowTitle("\u901a\u901a \u00b7 TrafficAgent")
         self.resize(1420, 860)
         self._build_ui()
@@ -82,6 +85,7 @@ class MainWindow(QMainWindow):
         self.container.sim_runner.logProduced.connect(self.append_log)
         self.container.sim_runner.runFailed.connect(self.show_error)
         self.history_panel.clear_records()
+        self._refresh_model_summary()
         self.append_log("\u901a\u901a\u670d\u52a1\u5df2\u7ed1\u5b9a\u3002")
         self.statusBar().showMessage("\u901a\u901a\u5df2\u5c31\u7eea")
 
@@ -266,7 +270,25 @@ class MainWindow(QMainWindow):
         self.container.user_preferences = dialog.collect_user_preferences()
         self.container.config_store.save_model_config(self.container.model_config)
         self.container.config_store.save_user_preferences(self.container.user_preferences)
-        self.append_log("\u5df2\u4fdd\u5b58\u6a21\u578b\u914d\u7f6e\u548c\u7528\u6237\u504f\u597d\u3002")
+        if self.current_project_meta is None:
+            self.current_simulation_spec = self.current_simulation_spec.model_copy(
+                update={"end_time": self.container.user_preferences.default_duration}
+            )
+            self.control_panel.load_simulation_spec(self.current_simulation_spec)
+        self._refresh_model_summary()
+        self.statusBar().showMessage(f"\u6a21\u578b\u8bbe\u7f6e\u5df2\u4fdd\u5b58\uff1a{self.container.model_config.model}")
+        self.append_log(f"\u5df2\u4fdd\u5b58\u6a21\u578b\u914d\u7f6e\u548c\u7528\u6237\u504f\u597d\uff0c\u5f53\u524d\u6a21\u578b\uff1a{self.container.model_config.model}")
+
+    def _refresh_model_summary(self) -> None:
+        if self._model_summary_label is None:
+            return
+        if self.container is None:
+            self._model_summary_label.setText("\u5f53\u524d\u6a21\u578b\uff1a\u672a\u7ed1\u5b9a")
+            return
+        config = self.container.model_config
+        key_state = "\u5df2\u914d\u7f6e Key" if config.api_key else "\u672a\u914d\u7f6e Key"
+        vision_state = "\u652f\u6301\u8bc6\u56fe" if config.supports_vision else "\u6587\u672c\u6a21\u578b"
+        self._model_summary_label.setText(f"\u5f53\u524d\u6a21\u578b\uff1a{config.model} | {key_state} | {vision_state}")
 
     def _handle_chat_message(self, text: str) -> None:
         if self.container is None:
@@ -638,7 +660,16 @@ class MainWindow(QMainWindow):
         card.setObjectName("workspaceHero")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(12)
+
+        title_layout = QVBoxLayout()
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(6)
+
         eyebrow = QLabel("CONTROL ROOM")
         eyebrow.setObjectName("workspaceEyebrow")
         title = QLabel("\u53f3\u4fa7\u5de5\u4f5c\u53f0")
@@ -646,9 +677,22 @@ class MainWindow(QMainWindow):
         description = QLabel("\u53c2\u6570\u3001\u72b6\u6001\u3001\u5386\u53f2\u548c\u65e5\u5fd7\u5df2\u7ecf\u5207\u6362\u4e3a\u6807\u7b7e\u5de5\u4f5c\u533a\uff0c\u907f\u514d\u5c0f\u5c4f\u6216\u72ed\u5bbd\u5e03\u5c40\u4e0b\u5404\u4e2a\u6a21\u5757\u4e92\u76f8\u6324\u538b\u3002")
         description.setObjectName("workspaceDescription")
         description.setWordWrap(True)
-        layout.addWidget(eyebrow)
-        layout.addWidget(title)
+        self._model_summary_label = QLabel("\u5f53\u524d\u6a21\u578b\uff1a\u672a\u7ed1\u5b9a")
+        self._model_summary_label.setObjectName("workspaceMeta")
+        self._model_summary_label.setWordWrap(True)
+
+        settings_button = QPushButton("\u6a21\u578b\u8bbe\u7f6e")
+        settings_button.setObjectName("heroAction")
+        settings_button.clicked.connect(self._open_settings)
+
+        title_layout.addWidget(eyebrow)
+        title_layout.addWidget(title)
+        top_row.addLayout(title_layout, 1)
+        top_row.addWidget(settings_button, 0, Qt.AlignTop)
+
+        layout.addLayout(top_row)
         layout.addWidget(description)
+        layout.addWidget(self._model_summary_label)
         return card
 
     def _build_log_card(self) -> QFrame:
@@ -685,6 +729,9 @@ class MainWindow(QMainWindow):
             QLabel#workspaceEyebrow { color: #64748B; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; }
             QLabel#workspaceTitle, QLabel#workspaceCardTitle { color: #0F172A; font-size: 16px; font-weight: 600; }
             QLabel#workspaceDescription, QLabel#workspaceCardHint { color: #475569; font-size: 12px; }
+            QLabel#workspaceMeta { color: #334155; font-size: 12px; font-weight: 600; }
+            QPushButton#heroAction { background: #FFFFFF; color: #0F172A; border: 1px solid #D8E2F0; border-radius: 12px; padding: 9px 14px; font-weight: 600; }
+            QPushButton#heroAction:hover { background: #F8FAFC; border-color: #B7C5D9; }
             QPlainTextEdit#logOutput { background: #FFFFFF; border: 1px solid #E3EAF4; border-radius: 14px; color: #0F172A; padding: 12px; selection-background-color: #DCE9FF; }
             QStatusBar { background: #F8FAFC; border-top: 1px solid #E7EDF5; color: #475569; }
             QSplitter#mainSplitter::handle { background: transparent; }

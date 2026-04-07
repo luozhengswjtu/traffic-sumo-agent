@@ -1849,7 +1849,7 @@ class AgentOrchestrator:
 
     @staticmethod
     def is_confirm_draft_text(text: str) -> bool:
-        return any(token in text for token in ("\u786e\u8ba4\u751f\u6210", "\u5c31\u6309\u8fd9\u4e2a\u751f\u6210", "\u6309\u8fd9\u4e2a\u751f\u6210", "\u751f\u6210\u8fd9\u4e2a", "\u751f\u6210\u5427"))
+        return any(token in text for token in ("\u786e\u8ba4\u751f\u6210", "\u786e\u5b9a\u751f\u6210", "\u786e\u8ba4\u4e00\u4e0b\u751f\u6210", "\u5c31\u6309\u8fd9\u4e2a\u751f\u6210", "\u6309\u8fd9\u4e2a\u751f\u6210", "\u6309\u8fd9\u4e2a\u6765", "\u5c31\u8fd9\u6837", "\u5c31\u7528\u8fd9\u4e2a", "\u751f\u6210\u8fd9\u4e2a", "\u751f\u6210\u5427", "\u53ef\u4ee5\u751f\u6210\u4e86", "\u76f4\u63a5\u751f\u6210", "\u5f00\u59cb\u751f\u6210"))
 
     @staticmethod
     def is_cancel_draft_text(text: str) -> bool:
