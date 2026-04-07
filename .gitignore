@@ -4,6 +4,13 @@
 workspace/projects/*
 !workspace/projects/.gitkeep
 
+# Local/private repository metadata
+.codex/
+ChatGPT.md
+HUMAN.md
+plan.md
+route.md
+
 __pycache__/
 *.py[cod]
 *.pyo
