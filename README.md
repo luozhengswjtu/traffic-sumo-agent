@@ -1,4 +1,4 @@
-# TrafficAgent
+﻿# TrafficAgent
 
 TrafficAgent 是一个面向 Windows 的 SUMO 桌面应用，目标是把“场景创建、参数调整、项目生成、仿真运行”整合进一个聊天式工作流里。
 
@@ -8,7 +8,8 @@ TrafficAgent 是一个面向 Windows 的 SUMO 桌面应用，目标是把“场�
 - 本地项目与配置存储
 - 路网、路线、仿真配置生成
 - 基于 TraCI 的 SUMO 仿真控制
-- OpenAI-compatible 模型接入
+- 基于 AutoGen 的助手编排与工具调用
+- 兼容 OpenAI-style API 的模型接入
 - 路口图片分析草稿能力
 
 ![主界面截图](./artifacts_chat_layout.png)
@@ -29,13 +30,30 @@ TrafficAgent 是一个面向 Windows 的 SUMO 桌面应用，目标是把“场�
 - 在运行前对项目文件进行校验
 - 在桌面界面中启动、暂停、恢复、单步执行和停止仿真
 - 本地保存最近项目、用户偏好和模型配置
-- 通过 OpenAI-compatible chat completions 接口驱动助手能力
+- 通过 AutoGen + OpenAI-compatible 模型接口驱动助手能力
 - 上传路口图片并生成可继续编辑的结构化草稿
 
 示例资源：
 
 - 界面截图：`artifacts_chat_layout.png`
 - 路口样例图：`artifacts/e2e_intersection_sample.png`
+
+## 助手架构
+
+当前助手链路已经切到 AutoGen，整体结构如下：
+
+- `ui/`：PySide6 桌面界面与后台任务线程
+- `agent/`：AutoGen 桥接、提示词、记忆、工具规划与回退规则
+- `model_providers/`：基于 `OpenAIChatCompletionClient` 的模型适配层
+- `sumo_tools/`：场景、路网、路线、仿真配置生成
+- `sim_runner/`：SUMO 进程控制与 TraCI 运行控制
+
+当前 `AgentOrchestrator` 的执行顺序为：
+
+1. 本地快捷回复
+2. AutoGen 规划回复和工具调用
+3. 本地工具执行与结果汇总
+4. AutoGen 失败时回退到本地规则解析
 
 ## 快速开始
 
@@ -53,7 +71,13 @@ conda env create -f environment.yml -p .\.conda
 conda activate .\.conda
 ```
 
-### 2. 安装并配置 SUMO
+### 2. 验证 Python 侧依赖
+
+```powershell
+python -c "import PySide6, pydantic, autogen_agentchat, autogen_ext; print('python deps ok')"
+```
+
+### 3. 安装并配置 SUMO
 
 请先单独安装 SUMO，然后在当前 PowerShell 会话中配置其可执行文件和 Python 工具路径：
 
@@ -67,7 +91,7 @@ $env:PYTHONPATH = "$env:SUMO_HOME\tools;$env:PYTHONPATH"
 
 详细说明见：[docs/setup-windows.md](./docs/setup-windows.md)
 
-### 3. 启动应用
+### 4. 启动应用
 
 ```powershell
 python app\main.py
@@ -97,12 +121,17 @@ python app\main.py
 - `temperature`：生成温度
 - `timeout_seconds`：请求超时时间
 
+说明：
+
+- 当前代码通过 AutoGen 调用模型，但底层仍要求提供兼容 OpenAI-style API 的服务端
+- 文本和图片能力都复用同一份模型配置；是否支持图片由 `supports_vision` 控制
+
 ## 目录结构
 
 ```text
 app/                应用入口与启动装配
-agent/              助手编排、提示词与工具规划
-model_providers/    OpenAI-compatible 模型客户端
+agent/              AutoGen 桥接、提示词、记忆、工具规划与规则回退
+model_providers/    OpenAI-compatible 模型客户端与 AutoGen 适配
 sim_runner/         SUMO 进程与 TraCI 运行控制
 storage/            本地配置、历史与项目存储
 sumo_domain/        Pydantic 领域模型

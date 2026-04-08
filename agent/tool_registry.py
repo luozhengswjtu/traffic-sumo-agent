@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -51,3 +51,8 @@ class ToolRegistry:
 
     def has_tool(self, name: str) -> bool:
         return name in self._tools
+
+    def get_tool(self, name: str) -> RegisteredTool:
+        if name not in self._tools:
+            raise KeyError(f"未知工具: {name}")
+        return self._tools[name]

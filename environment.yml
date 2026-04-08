@@ -1,4 +1,4 @@
-name: traffic-agent
+﻿name: traffic-agent
 channels:
   - conda-forge
 dependencies:
@@ -6,3 +6,7 @@ dependencies:
   - pyside6>=6.7,<7
   - pydantic>=2,<3
   - pip
+  - pip:
+      - autogen-agentchat>=0.7.5,<0.8
+      - "autogen-ext[openai]>=0.7.5,<0.8"
+

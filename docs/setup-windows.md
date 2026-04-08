@@ -1,4 +1,4 @@
-# Windows Setup
+﻿# Windows Setup
 
 This document describes the recommended Windows setup path for running TrafficAgent from source.
 
@@ -51,7 +51,7 @@ If you want these variables to persist, set them in your own Windows environment
 Verify Python-side dependencies:
 
 ```powershell
-python -c "import PySide6, pydantic; print('python deps ok')"
+python -c "import PySide6, pydantic, autogen_agentchat, autogen_ext; print('python deps ok')"
 ```
 
 Verify SUMO executables:
@@ -138,7 +138,7 @@ Cause:
 
 Effect:
 
-- Model-backed assistant flows will fail
+- AutoGen-backed assistant flows will fail
 
 ### PowerShell profile execution warnings
 
@@ -159,3 +159,4 @@ Workaround:
 - This repository does not currently ship a Windows installer
 - This repository does not bundle SUMO binaries
 - The primary supported path is running from source in a Conda environment
+
