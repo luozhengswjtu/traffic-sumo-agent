@@ -40,9 +40,11 @@ from sumo_domain.project_spec import (
     ProjectScenarioState,
     RecentProjectItem,
 )
+from sumo_domain.signal_plan import SignalPlanSpec, SignalPlanUpdate, normalize_signal_plan
 from sumo_tools.config_generator import SimulationConfigRequest
 from sumo_tools.network_generator import NetworkGenerationRequest
 from sumo_tools.route_generator import RouteGenerationRequest
+from sumo_tools.signal_logic import TLS_ADDITIONAL_FILENAME, signal_additional_files
 
 
 class ParsedCommand(BaseModel):
@@ -60,12 +62,21 @@ class ParsedCommand(BaseModel):
     flow_multiplier: float | None = None
     traffic_bias: str | None = None
     seed: int | None = None
+    signal_enabled: bool | None = None
+    signal_plan_name: str | None = None
+    signal_cycle_seconds: int | None = None
+    signal_offset_seconds: int | None = None
+    signal_yellow_seconds: int | None = None
+    signal_all_red_seconds: int | None = None
+    signal_ns_green_seconds: int | None = None
+    signal_ew_green_seconds: int | None = None
     history_limit: int = 5
     reset_traffic_bias: bool = False
     reset_seed: bool = False
     reset_flow_to_default: bool = False
     reset_duration_to_default: bool = False
     reset_step_length_to_default: bool = False
+    reset_signal_plan: bool = False
     should_run_simulation: bool = False
     preference_updates: dict = Field(default_factory=dict)
     project_name: str | None = None
@@ -75,6 +86,7 @@ class ParsedCommand(BaseModel):
 class AssistantProgress:
     stage: str
     message: str
+    kind: str = "status"
 
 
 @dataclass(slots=True)
@@ -210,11 +222,21 @@ class AgentOrchestrator:
             self.memory.append_agent_message(result.reply_text)
             return result
 
-        self._emit_progress(progress_callback, "\u89c4\u5212\u4e2d", f"{ASSISTANT_NAME} \u6b63\u5728\u901a\u8fc7 AutoGen \u89c4\u5212\u56de\u590d\u548c\u5de5\u5177...")
-        autogen_result = self._run_with_autogen(text, project, context_parts)
+        self._emit_progress(progress_callback, "\u89c4\u5212\u4e2d", f"{ASSISTANT_NAME} \u6b63\u5728\u89c4\u5212\u56de\u590d\u548c\u5de5\u5177...")
+        autogen_result = self._run_with_autogen(
+            text,
+            project,
+            context_parts,
+            stream_callback=lambda chunk: self._emit_progress(
+                progress_callback,
+                "\u8f93\u51fa\u4e2d",
+                chunk,
+                kind="stream",
+            ),
+        )
         if autogen_result is not None:
             if autogen_result.tool_runs:
-                self._emit_progress(progress_callback, "\u6267\u884c\u4e2d", f"{ASSISTANT_NAME} \u6b63\u5728\u6267\u884c AutoGen \u9009\u4e2d\u7684\u5de5\u5177...")
+                self._emit_progress(progress_callback, "\u6267\u884c\u4e2d", f"{ASSISTANT_NAME} \u6b63\u5728\u6267\u884c\u5df2\u9009\u62e9\u7684\u5de5\u5177...")
                 tool_summaries, result = self._merge_autogen_tool_runs(autogen_result.tool_runs, project)
                 for issue in autogen_result.issues:
                     if issue not in result.issues:
@@ -250,7 +272,7 @@ class AgentOrchestrator:
             self._emit_progress(progress_callback, "\u6267\u884c\u4e2d", f"{ASSISTANT_NAME} \u6b63\u5728\u6309\u672c\u5730\u89c4\u5219\u6267\u884c\u5de5\u5177...")
             tool_summaries, result = self.execute_tool_plan(tool_calls, project)
             if self._last_model_error:
-                fallback_issue = f"AutoGen \u89c4\u5212\u5df2\u56de\u9000\u5230\u672c\u5730\u89c4\u5219\uff1a{self._last_model_error}"
+                fallback_issue = f"\u6a21\u578b\u89c4\u5212\u5df2\u56de\u9000\u5230\u672c\u5730\u89c4\u5219\uff1a{self._last_model_error}"
                 if fallback_issue not in result.issues:
                     result.issues.append(fallback_issue)
             self._emit_progress(progress_callback, "\u6574\u7406\u7ed3\u679c", f"{ASSISTANT_NAME} \u6b63\u5728\u6574\u7406\u7ed3\u679c...")
@@ -268,7 +290,7 @@ class AgentOrchestrator:
 
         issues: list[str] = []
         if self._last_model_error:
-            issues.append(f"AutoGen \u89c4\u5212\u5df2\u56de\u9000\u5230\u672c\u5730\u89c4\u5219\uff1a{self._last_model_error}")
+            issues.append(f"\u6a21\u578b\u89c4\u5212\u5df2\u56de\u9000\u5230\u672c\u5730\u89c4\u5219\uff1a{self._last_model_error}")
         result = AgentExecutionResult(
             reply_text=self._fallback_reply(fallback_command, project),
             updated_project=project,
@@ -283,7 +305,7 @@ class AgentOrchestrator:
         lowered = text.lower()
         has_edit = any(token in text for token in ("\u6539\u6210", "\u4fee\u6539", "\u8c03\u6574", "\u63d0\u9ad8", "\u589e\u52a0", "\u964d\u4f4e", "\u51cf\u5c11", "\u8bbe\u4e3a", "\u8bbe\u7f6e", "\u66f4\u65b0", "\u6062\u590d\u9ed8\u8ba4", "\u53bb\u6389", "\u53d6\u6d88"))
         has_scenario = any(token in text for token in ("\u751f\u6210", "\u521b\u5efa", "\u65b0\u5efa", "\u5341\u5b57", "\u8def\u53e3", "t\u5b57", "T\u5b57", "\u4e01\u5b57", "\u8def\u6bb5", "\u8d70\u5eca"))
-        has_param = any(token in text for token in ("\u6d41\u91cf", "\u6b65\u957f", "\u65f6\u957f", "\u8f66\u9053", "\u9650\u901f", "\u901f\u5ea6", "seed", "\u79cd\u5b50", "\u957f\u5ea6", "\u504f\u5411", "\u5357\u5317", "\u4e1c\u897f"))
+        has_param = any(token in text for token in ("\u6d41\u91cf", "\u6b65\u957f", "\u65f6\u957f", "\u8f66\u9053", "\u9650\u901f", "\u901f\u5ea6", "seed", "\u79cd\u5b50", "\u957f\u5ea6", "\u504f\u5411", "\u5357\u5317", "\u4e1c\u897f", "\u4fe1\u53f7\u706f", "\u4fe1\u63a7", "\u914d\u65f6", "\u5468\u671f", "\u9ec4\u706f", "\u5168\u7ea2", "offset"))
         has_run = any(token in text for token in ("\u8fd0\u884c", "\u542f\u52a8", "\u5f00\u59cb\u4eff\u771f", "\u4eff\u771f\u4e00\u4e0b")) or "run" in lowered
         has_summary = any(token in text for token in ("\u5f53\u524d\u9879\u76ee", "\u9879\u76ee\u60c5\u51b5", "\u5f53\u524d\u573a\u666f", "\u573a\u666f\u6458\u8981", "\u603b\u7ed3\u5f53\u524d", "\u9879\u76ee\u662f\u4ec0\u4e48", "\u770b\u770b\u5f53\u524d"))
         has_history = any(token in text for token in ("\u64cd\u4f5c\u5386\u53f2", "\u6700\u8fd1\u53d8\u66f4", "\u67e5\u770b\u5386\u53f2", "\u5386\u53f2\u8bb0\u5f55", "\u6700\u8fd1\u64cd\u4f5c", "\u8ffd\u6eaf\u8bb0\u5f55"))
@@ -399,10 +421,11 @@ class AgentOrchestrator:
         progress_callback: Callable[[AssistantProgress], None] | None,
         stage: str,
         message: str,
+        kind: str = "status",
     ) -> None:
         if progress_callback is None:
             return
-        progress_callback(AssistantProgress(stage=stage, message=message))
+        progress_callback(AssistantProgress(stage=stage, message=message, kind=kind))
 
     def _build_context_parts(self, project: ProjectContext | None, preferences: UserPreferences) -> dict[str, str | None]:
         return {
@@ -416,6 +439,7 @@ class AgentOrchestrator:
         text: str,
         project: ProjectContext | None,
         context_parts: dict[str, str | None],
+        stream_callback: Callable[[str], None] | None = None,
     ):
         system_message = "\n\n".join(
             part
@@ -435,6 +459,7 @@ class AgentOrchestrator:
                 text=text,
                 system_message=system_message,
                 runtime_context={"project": project},
+                stream_callback=stream_callback,
             )
         except Exception as exc:
             self._last_model_error = self._format_model_error(str(exc) or exc.__class__.__name__)
@@ -544,6 +569,8 @@ class AgentOrchestrator:
             "reset_flow_to_default",
             "reset_duration_to_default",
             "reset_step_length_to_default",
+            "signal_enabled",
+            "reset_signal_plan",
         }:
             value = normalized.get(key)
             if value is None:
@@ -571,7 +598,19 @@ class AgentOrchestrator:
                 except (TypeError, ValueError):
                     normalized.pop("flow_multiplier", None)
 
-            for key in ("lane_count", "lane_delta", "duration_seconds", "flow_rate", "seed"):
+            for key in (
+                "lane_count",
+                "lane_delta",
+                "duration_seconds",
+                "flow_rate",
+                "seed",
+                "signal_cycle_seconds",
+                "signal_offset_seconds",
+                "signal_yellow_seconds",
+                "signal_all_red_seconds",
+                "signal_ns_green_seconds",
+                "signal_ew_green_seconds",
+            ):
                 if normalized.get(key) is None:
                     continue
                 try:
@@ -632,6 +671,15 @@ class AgentOrchestrator:
                     flow_multiplier=args.get("flow_multiplier"),
                     traffic_bias=args.get("traffic_bias"),
                     seed=args.get("seed"),
+                    signal_enabled=args.get("signal_enabled"),
+                    signal_plan_name=args.get("signal_plan_name"),
+                    signal_cycle_seconds=args.get("signal_cycle_seconds"),
+                    signal_offset_seconds=args.get("signal_offset_seconds"),
+                    signal_yellow_seconds=args.get("signal_yellow_seconds"),
+                    signal_all_red_seconds=args.get("signal_all_red_seconds"),
+                    signal_ns_green_seconds=args.get("signal_ns_green_seconds"),
+                    signal_ew_green_seconds=args.get("signal_ew_green_seconds"),
+                    reset_signal_plan=bool(args.get("reset_signal_plan", False)),
                     should_run_simulation=bool(args.get("should_run_simulation")),
                 )
             if tool_call.name == "update_preferences":
@@ -663,11 +711,20 @@ class AgentOrchestrator:
                     "flow_multiplier": command.flow_multiplier,
                     "traffic_bias": command.traffic_bias,
                     "seed": command.seed,
+                    "signal_enabled": command.signal_enabled,
+                    "signal_plan_name": command.signal_plan_name,
+                    "signal_cycle_seconds": command.signal_cycle_seconds,
+                    "signal_offset_seconds": command.signal_offset_seconds,
+                    "signal_yellow_seconds": command.signal_yellow_seconds,
+                    "signal_all_red_seconds": command.signal_all_red_seconds,
+                    "signal_ns_green_seconds": command.signal_ns_green_seconds,
+                    "signal_ew_green_seconds": command.signal_ew_green_seconds,
                     "reset_traffic_bias": command.reset_traffic_bias,
                     "reset_seed": command.reset_seed,
                     "reset_flow_to_default": command.reset_flow_to_default,
                     "reset_duration_to_default": command.reset_duration_to_default,
                     "reset_step_length_to_default": command.reset_step_length_to_default,
+                    "reset_signal_plan": command.reset_signal_plan,
                     "should_run_simulation": command.should_run_simulation,
                     "project_name": command.project_name,
                 }.items()
@@ -713,11 +770,20 @@ class AgentOrchestrator:
                     "flow_multiplier": {"type": "number", "minimum": 0.05},
                     "traffic_bias": {"type": "string", "enum": ["north_south", "east_west"]},
                     "seed": {"type": "integer", "minimum": 0},
+                    "signal_enabled": {"type": "boolean"},
+                    "signal_plan_name": {"type": "string", "enum": ["balanced", "ns_priority", "ew_priority", "custom"]},
+                    "signal_cycle_seconds": {"type": "integer", "minimum": 20},
+                    "signal_offset_seconds": {"type": "integer", "minimum": 0},
+                    "signal_yellow_seconds": {"type": "integer", "minimum": 0},
+                    "signal_all_red_seconds": {"type": "integer", "minimum": 0},
+                    "signal_ns_green_seconds": {"type": "integer", "minimum": 5},
+                    "signal_ew_green_seconds": {"type": "integer", "minimum": 5},
                     "reset_traffic_bias": {"type": "boolean"},
                     "reset_seed": {"type": "boolean"},
                     "reset_flow_to_default": {"type": "boolean"},
                     "reset_duration_to_default": {"type": "boolean"},
                     "reset_step_length_to_default": {"type": "boolean"},
+                    "reset_signal_plan": {"type": "boolean"},
                     "should_run_simulation": {"type": "boolean"},
                     "project_name": {"type": "string"},
                 },
@@ -786,11 +852,20 @@ class AgentOrchestrator:
             flow_multiplier=arguments.get("flow_multiplier"),
             traffic_bias=arguments.get("traffic_bias"),
             seed=arguments.get("seed"),
+            signal_enabled=arguments.get("signal_enabled"),
+            signal_plan_name=arguments.get("signal_plan_name"),
+            signal_cycle_seconds=arguments.get("signal_cycle_seconds"),
+            signal_offset_seconds=arguments.get("signal_offset_seconds"),
+            signal_yellow_seconds=arguments.get("signal_yellow_seconds"),
+            signal_all_red_seconds=arguments.get("signal_all_red_seconds"),
+            signal_ns_green_seconds=arguments.get("signal_ns_green_seconds"),
+            signal_ew_green_seconds=arguments.get("signal_ew_green_seconds"),
             reset_traffic_bias=bool(arguments.get("reset_traffic_bias", False)),
             reset_seed=bool(arguments.get("reset_seed", False)),
             reset_flow_to_default=bool(arguments.get("reset_flow_to_default", False)),
             reset_duration_to_default=bool(arguments.get("reset_duration_to_default", False)),
             reset_step_length_to_default=bool(arguments.get("reset_step_length_to_default", False)),
+            reset_signal_plan=bool(arguments.get("reset_signal_plan", False)),
             should_run_simulation=bool(arguments.get("should_run_simulation", False)),
             project_name=arguments.get("project_name"),
         )
@@ -819,6 +894,7 @@ class AgentOrchestrator:
                 directional_lanes=next_state.directional_lanes,
                 road_length=next_state.road_length,
                 speed_limit=next_state.speed_limit,
+                signal_enabled=next_state.signal_plan is not None and next_state.signal_plan.enabled,
             )
         )
         routes = self.route_generator.generate_routes(
@@ -836,9 +912,11 @@ class AgentOrchestrator:
                 duration_seconds=next_state.duration_seconds,
                 step_length=next_state.step_length,
                 seed=next_state.seed,
+                additional_files=signal_additional_files(next_state.signal_plan),
             ),
         )
         updated_context = ProjectContext(meta=meta, network=network, routes=routes, simulation=simulation, scenario_state=next_state)
+        self.project_store.save_scenario_state(Path(meta.project_dir), next_state)
         build_result = self.project_builder.build_project(updated_context)
         issue_texts = [f"{issue.level}: {issue.message}" for issue in build_result.issues]
         has_build_errors = any(issue.level == "error" for issue in build_result.issues)
@@ -985,6 +1063,22 @@ class AgentOrchestrator:
         elif directional_lanes.has_any() and (command.lane_count is not None or command.lane_delta is not None or command.scenario_type is not None):
             directional_lanes = directional_lanes.merged_with_fallback(scenario_type, lane_count)
 
+        signal_update = SignalPlanUpdate(
+            enabled=command.signal_enabled,
+            plan_name=command.signal_plan_name,
+            cycle_seconds=command.signal_cycle_seconds,
+            offset_seconds=command.signal_offset_seconds,
+            yellow_seconds=command.signal_yellow_seconds,
+            all_red_seconds=command.signal_all_red_seconds,
+            ns_green_seconds=command.signal_ns_green_seconds,
+            ew_green_seconds=command.signal_ew_green_seconds,
+            reset=command.reset_signal_plan,
+        )
+        signal_plan = normalize_signal_plan(
+            base.signal_plan,
+            signal_update if self._has_signal_payload(command) or command.reset_signal_plan else None,
+        )
+
         return ProjectScenarioState(
             scenario_type=scenario_type,
             lane_count=lane_count,
@@ -997,6 +1091,7 @@ class AgentOrchestrator:
             duration_seconds=duration_seconds,
             step_length=step_length,
             seed=seed,
+            signal_plan=signal_plan,
         )
 
     def _create_default_project_meta(self, command: ParsedCommand) -> ProjectMeta:
@@ -1082,10 +1177,43 @@ class AgentOrchestrator:
                 command.flow_level = "medium"
         if any(token in text for token in ("\u53d6\u6d88\u504f\u5411", "\u6e05\u7a7a\u504f\u5411", "\u53bb\u6389\u504f\u5411")):
             command.reset_traffic_bias = True
-        elif "\u5357\u5317" in text:
+        elif any(token in text for token in ("\u5357\u5317\u6d41\u91cf\u504f\u5411", "\u6d41\u91cf\u504f\u5411\u5357\u5317", "\u4ea4\u901a\u504f\u5411\u5357\u5317", "\u8f66\u6d41\u504f\u5411\u5357\u5317")):
             command.traffic_bias = "north_south"
-        elif "\u4e1c\u897f" in text:
+        elif any(token in text for token in ("\u4e1c\u897f\u6d41\u91cf\u504f\u5411", "\u6d41\u91cf\u504f\u5411\u4e1c\u897f", "\u4ea4\u901a\u504f\u5411\u4e1c\u897f", "\u8f66\u6d41\u504f\u5411\u4e1c\u897f")):
             command.traffic_bias = "east_west"
+        if any(token in text for token in ("\u91cd\u7f6e\u4fe1\u63a7", "\u6062\u590d\u9ed8\u8ba4\u4fe1\u63a7", "\u91cd\u7f6e\u914d\u65f6", "\u6e05\u7a7a\u4fe1\u53f7\u706f")):
+            command.reset_signal_plan = True
+        if any(token in text for token in ("\u5173\u95ed\u4fe1\u53f7\u706f", "\u5173\u95ed\u4fe1\u63a7", "\u53d6\u6d88\u4fe1\u53f7\u706f", "\u53bb\u6389\u4fe1\u53f7\u706f")):
+            command.signal_enabled = False
+            command.reset_signal_plan = True
+        elif any(token in text for token in ("\u5f00\u542f\u4fe1\u53f7\u706f", "\u542f\u7528\u4fe1\u53f7\u706f", "\u5f00\u542f\u4fe1\u63a7", "\u542f\u7528\u4fe1\u63a7", "\u52a0\u4fe1\u53f7\u706f")):
+            command.signal_enabled = True
+        if any(token in text for token in ("\u5747\u8861\u914d\u65f6", "\u5e73\u8861\u914d\u65f6", "\u5747\u8861\u4fe1\u63a7")):
+            command.signal_plan_name = "balanced"
+        elif "\u5357\u5317\u4f18\u5148" in text:
+            command.signal_plan_name = "ns_priority"
+        elif "\u4e1c\u897f\u4f18\u5148" in text:
+            command.signal_plan_name = "ew_priority"
+        cycle_match = re.search("(?:\u4fe1\u53f7\u5468\u671f|\u5468\u671f)(?:\u4e3a|=|\u6539\u6210|\u6539\u4e3a|\u8bbe\u4e3a|\u8bbe\u7f6e\u4e3a|\u8c03\u6574\u4e3a)?\\s*(\\d+)\\s*\u79d2", text)
+        offset_match = re.search("(?:offset|\u504f\u79fb|\u76f8\u4f4d\u5dee)(?:\u4e3a|=|\u6539\u6210|\u6539\u4e3a|\u8bbe\u4e3a|\u8bbe\u7f6e\u4e3a|\u8c03\u6574\u4e3a)?\\s*(\\d+)\\s*(?:\u79d2)?", text, re.IGNORECASE)
+        yellow_match = re.search("\u9ec4\u706f(?:\u4e3a|=|\u6539\u6210|\u6539\u4e3a|\u8bbe\u4e3a|\u8bbe\u7f6e\u4e3a|\u8c03\u6574\u4e3a)?\\s*(\\d+)\\s*\u79d2", text)
+        all_red_match = re.search("\u5168\u7ea2(?:\u4e3a|=|\u6539\u6210|\u6539\u4e3a|\u8bbe\u4e3a|\u8bbe\u7f6e\u4e3a|\u8c03\u6574\u4e3a)?\\s*(\\d+)\\s*\u79d2", text)
+        ns_green_match = re.search("(?:\u5357\u5317\u7eff|\u5357\u5317\u7eff\u706f)(?:\u4e3a|=|\u6539\u6210|\u6539\u4e3a|\u8bbe\u4e3a|\u8bbe\u7f6e\u4e3a|\u8c03\u6574\u4e3a)?\\s*(\\d+)\\s*\u79d2", text)
+        ew_green_match = re.search("(?:\u4e1c\u897f\u7eff|\u4e1c\u897f\u7eff\u706f)(?:\u4e3a|=|\u6539\u6210|\u6539\u4e3a|\u8bbe\u4e3a|\u8bbe\u7f6e\u4e3a|\u8c03\u6574\u4e3a)?\\s*(\\d+)\\s*\u79d2", text)
+        if cycle_match:
+            command.signal_cycle_seconds = int(cycle_match.group(1))
+        if offset_match:
+            command.signal_offset_seconds = int(offset_match.group(1))
+        if yellow_match:
+            command.signal_yellow_seconds = int(yellow_match.group(1))
+        if all_red_match:
+            command.signal_all_red_seconds = int(all_red_match.group(1))
+        if ns_green_match:
+            command.signal_ns_green_seconds = int(ns_green_match.group(1))
+        if ew_green_match:
+            command.signal_ew_green_seconds = int(ew_green_match.group(1))
+        if self._has_signal_payload(command) and command.signal_enabled is None and not command.reset_signal_plan:
+            command.signal_enabled = True
         if any(token in text for token in ("\u53d6\u6d88\u968f\u673a\u79cd\u5b50", "\u6e05\u7a7a\u968f\u673a\u79cd\u5b50", "\u6e05\u7a7aseed", "\u53d6\u6d88seed", "\u4e0d\u8981\u79cd\u5b50")):
             command.reset_seed = True
         if any(token in text for token in ("\u6062\u590d\u9ed8\u8ba4\u6d41\u91cf", "\u6d41\u91cf\u6062\u590d\u9ed8\u8ba4")):
@@ -1133,7 +1261,23 @@ class AgentOrchestrator:
 
     @staticmethod
     def _has_edit_payload(command: ParsedCommand) -> bool:
-        return any(value is not None for value in (command.scenario_type, command.lane_count, command.lane_delta, command.road_length, command.speed_limit, command.duration_seconds, command.step_length, command.flow_level, command.flow_rate, command.flow_multiplier, command.traffic_bias, command.seed)) or (command.directional_lanes is not None and command.directional_lanes.has_any()) or any((command.reset_traffic_bias, command.reset_seed, command.reset_flow_to_default, command.reset_duration_to_default, command.reset_step_length_to_default))
+        return any(value is not None for value in (command.scenario_type, command.lane_count, command.lane_delta, command.road_length, command.speed_limit, command.duration_seconds, command.step_length, command.flow_level, command.flow_rate, command.flow_multiplier, command.traffic_bias, command.seed)) or (command.directional_lanes is not None and command.directional_lanes.has_any()) or AgentOrchestrator._has_signal_payload(command) or any((command.reset_traffic_bias, command.reset_seed, command.reset_flow_to_default, command.reset_duration_to_default, command.reset_step_length_to_default, command.reset_signal_plan))
+
+    @staticmethod
+    def _has_signal_payload(command: ParsedCommand) -> bool:
+        return any(
+            value is not None
+            for value in (
+                command.signal_enabled,
+                command.signal_plan_name,
+                command.signal_cycle_seconds,
+                command.signal_offset_seconds,
+                command.signal_yellow_seconds,
+                command.signal_all_red_seconds,
+                command.signal_ns_green_seconds,
+                command.signal_ew_green_seconds,
+            )
+        )
 
     def _extract_json_object(self, text: str) -> dict | None:
         if not text:
@@ -1222,6 +1366,7 @@ class AgentOrchestrator:
             f"\u9053\u8def\u957f\u5ea6={int(round(state.road_length))}m\uff0c\u9650\u901f={self._format_speed_limit(state.speed_limit)}",
             f"\u6d41\u91cf={self._describe_flow(state)}\uff0c\u504f\u5411={bias_map.get(state.traffic_bias, state.traffic_bias or '')}",
             f"\u65f6\u957f={state.duration_seconds}s\uff0c\u6b65\u957f={state.step_length}\uff0cseed={seed}",
+            f"\u4fe1\u63a7={self._format_signal_plan(state.signal_plan)}",
             f"\u4e0a\u4e0b\u6587\uff1anetwork={'yes' if project.network else 'no'}\uff0croutes={'yes' if project.routes else 'no'}\uff0csimulation={'yes' if project.simulation else 'no'}",
         ])
 
@@ -1235,12 +1380,13 @@ class AgentOrchestrator:
                 f"- \u6d41\u91cf\uff1a{self._describe_flow(after)}",
                 f"- \u4eff\u771f\u65f6\u957f\uff1a{after.duration_seconds}s",
                 f"- \u4eff\u771f\u6b65\u957f\uff1a{after.step_length}",
+                f"- \u4fe1\u63a7\uff1a{self._format_signal_plan(after.signal_plan)}",
             ])
         changes = self._collect_state_changes(before, after)
         return "- \u672a\u68c0\u6d4b\u5230\u53c2\u6570\u53d8\u5316\uff0c\u5df2\u6309\u5f53\u524d\u72b6\u6001\u91cd\u65b0\u751f\u6210 SUMO \u6587\u4ef6\u3002" if not changes else chr(10).join(f"- {item}" for item in changes)
 
     def _collect_state_changes(self, before: ProjectScenarioState, after: ProjectScenarioState) -> list[str]:
-        labels = {"scenario_type": "\u573a\u666f\u7c7b\u578b", "lane_count": "\u7edf\u4e00\u8f66\u9053\u6570", "directional_lanes": "\u65b9\u5411\u8f66\u9053", "road_length": "\u9053\u8def\u957f\u5ea6", "speed_limit": "\u9650\u901f", "flow_level": "\u6d41\u91cf\u7b49\u7ea7", "flow_rate": "\u6d41\u91cf", "traffic_bias": "\u4ea4\u901a\u504f\u5411", "duration_seconds": "\u4eff\u771f\u65f6\u957f", "step_length": "\u4eff\u771f\u6b65\u957f", "seed": "\u968f\u673a\u79cd\u5b50"}
+        labels = {"scenario_type": "\u573a\u666f\u7c7b\u578b", "lane_count": "\u7edf\u4e00\u8f66\u9053\u6570", "directional_lanes": "\u65b9\u5411\u8f66\u9053", "road_length": "\u9053\u8def\u957f\u5ea6", "speed_limit": "\u9650\u901f", "flow_level": "\u6d41\u91cf\u7b49\u7ea7", "flow_rate": "\u6d41\u91cf", "traffic_bias": "\u4ea4\u901a\u504f\u5411", "duration_seconds": "\u4eff\u771f\u65f6\u957f", "step_length": "\u4eff\u771f\u6b65\u957f", "seed": "\u968f\u673a\u79cd\u5b50", "signal_plan": "\u4fe1\u63a7\u65b9\u6848"}
         before_dict = before.model_dump(mode="json")
         after_dict = after.model_dump(mode="json")
         changes: list[str] = []
@@ -1267,7 +1413,23 @@ class AgentOrchestrator:
             return f"{int(value)}s"
         if field == "seed":
             return "auto" if value is None else str(value)
+        if field == "signal_plan":
+            if value is None:
+                return "\u5173\u95ed"
+            plan = value if isinstance(value, SignalPlanSpec) else SignalPlanSpec.model_validate(value)
+            return self._format_signal_plan(plan)
         return str(value)
+
+    @staticmethod
+    def _format_signal_plan(signal_plan: SignalPlanSpec | None) -> str:
+        if signal_plan is None or not signal_plan.enabled:
+            return "\u5173\u95ed"
+        return (
+            f"{signal_plan.plan_name} | cycle={signal_plan.cycle_seconds}s | "
+            f"offset={signal_plan.offset_seconds}s | yellow={signal_plan.yellow_seconds}s | "
+            f"all_red={signal_plan.all_red_seconds}s | ns={signal_plan.ns_green_seconds}s | "
+            f"ew={signal_plan.ew_green_seconds}s"
+        )
 
     def _label_scenario(self, scenario_type: str | None) -> str:
         return {"intersection": "\u5341\u5b57\u8def\u53e3", "t_junction": "T \u5b57\u8def\u53e3", "corridor": "\u76f4\u7ebf\u8def\u6bb5"}.get(scenario_type, scenario_type or "\u672a\u8bbe\u7f6e")

@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from sumo_domain.network_spec import NetworkSpec
 from sumo_domain.route_spec import RouteSpec
+from sumo_domain.signal_plan import SignalPlanSpec
 from sumo_domain.simulation_spec import SimulationSpec
 
 
@@ -93,6 +94,7 @@ class ProjectScenarioState(BaseModel):
     duration_seconds: int = 1800
     step_length: float = 1.0
     seed: int | None = None
+    signal_plan: SignalPlanSpec | None = None
 
 
 class ProjectContext(BaseModel):

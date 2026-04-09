@@ -3,7 +3,7 @@
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from sumo_domain.simulation_spec import SimulationSpec
 
@@ -15,6 +15,7 @@ class SimulationConfigRequest(BaseModel):
     begin_time: int = 0
     route_file: str = "scenario.rou.xml"
     net_file: str = "scenario.net.xml"
+    additional_files: list[str] = Field(default_factory=list)
 
 
 class ConfigGenerator:
@@ -29,6 +30,7 @@ class ConfigGenerator:
             seed=request.seed,
             route_file=request.route_file,
             net_file=request.net_file,
+            additional_files=list(request.additional_files),
         )
 
     def write_sumocfg(self, path: Path, spec: SimulationSpec) -> Path:
@@ -37,6 +39,8 @@ class ConfigGenerator:
         input_section = ET.SubElement(root, "input")
         ET.SubElement(input_section, "net-file", value=spec.net_file)
         ET.SubElement(input_section, "route-files", value=spec.route_file)
+        if spec.additional_files:
+            ET.SubElement(input_section, "additional-files", value=",".join(spec.additional_files))
 
         time_section = ET.SubElement(root, "time")
         ET.SubElement(time_section, "begin", value=str(spec.begin_time))

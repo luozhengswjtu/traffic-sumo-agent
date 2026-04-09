@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,12 +30,14 @@ from sumo_domain.simulation_spec import SimulationSpec
 from sumo_tools.config_generator import SimulationConfigRequest
 from sumo_tools.network_generator import NetworkGenerationRequest
 from sumo_tools.route_generator import RouteGenerationRequest
+from sumo_tools.signal_logic import signal_additional_files
 from ui.chat_panel import ChatPanel
 from ui.control_panel import ControlPanel
 from ui.history_panel import HistoryPanel
 from ui.image_draft_dialog import ImageDraftDialog
 from ui.project_dialog import NewProjectDialog
 from ui.settings_dialog import SettingsDialog
+from ui.signal_plan_panel import SignalPlanPanel
 from ui.sim_status_panel import SimulationStatusPanel
 
 
@@ -72,6 +74,15 @@ class MainWindow(QMainWindow):
         self._close_after_task = False
         self._pending_image_draft: IntersectionImageDraft | None = None
         self._model_summary_label: QLabel | None = None
+        self._streamed_reply_text = ""
+        self._reply_stream_row: QWidget | None = None
+        self._reply_stream_target_text = ""
+        self._reply_stream_visible_text = ""
+        self._reply_stream_index = 0
+        self._reply_stream_complete = False
+        self._reply_stream_timer = QTimer(self)
+        self._reply_stream_timer.setInterval(34)
+        self._reply_stream_timer.timeout.connect(self._advance_reply_stream)
         self.setWindowTitle("\u901a\u901a \u00b7 TrafficAgent")
         self.resize(1420, 860)
         self._build_ui()
@@ -82,10 +93,12 @@ class MainWindow(QMainWindow):
         self.current_simulation_spec = SimulationSpec(end_time=container.user_preferences.default_duration)
         self.control_panel.load_simulation_spec(self.current_simulation_spec)
         self.container.sim_runner.stateChanged.connect(self.sim_status_panel.update_state)
+        self.container.sim_runner.stateChanged.connect(self.signal_plan_panel.update_runtime_state)
         self.container.sim_runner.logProduced.connect(self.append_log)
         self.container.sim_runner.runFailed.connect(self.show_error)
         self.history_panel.clear_records()
         self._refresh_model_summary()
+        self._sync_signal_panel()
         self.append_log("\u901a\u901a\u670d\u52a1\u5df2\u7ed1\u5b9a\u3002")
         self.statusBar().showMessage("\u901a\u901a\u5df2\u5c31\u7eea")
 
@@ -126,6 +139,7 @@ class MainWindow(QMainWindow):
         self.control_panel.stopRequested.connect(self._handle_stop_requested)
         self.control_panel.simulationParamsChanged.connect(self._handle_simulation_params_changed)
 
+        self.signal_plan_panel = SignalPlanPanel()
         self.sim_status_panel = SimulationStatusPanel()
         self.history_panel = HistoryPanel()
         self.history_panel.refreshRequested.connect(self._refresh_history_panel)
@@ -159,6 +173,11 @@ class MainWindow(QMainWindow):
         control_layout.setContentsMargins(0, 6, 0, 0)
         control_layout.addWidget(self.control_panel)
 
+        signal_page = QWidget()
+        signal_layout = QVBoxLayout(signal_page)
+        signal_layout.setContentsMargins(0, 6, 0, 0)
+        signal_layout.addWidget(self.signal_plan_panel)
+
         status_page = QWidget()
         status_layout = QVBoxLayout(status_page)
         status_layout.setContentsMargins(0, 6, 0, 0)
@@ -175,6 +194,7 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self._build_log_card())
 
         tabs.addTab(control_page, "\u63a7\u5236")
+        tabs.addTab(signal_page, "\u4fe1\u63a7")
         tabs.addTab(status_page, "\u72b6\u6001")
         tabs.addTab(history_page, "\u5386\u53f2")
         tabs.addTab(log_page, "\u65e5\u5fd7")
@@ -208,7 +228,22 @@ class MainWindow(QMainWindow):
             self.show_error(str(exc))
             return
         self.current_project_meta = meta
-        self.current_project_context = ProjectContext(meta=meta, simulation=self.current_simulation_spec)
+        scenario_state = self.container.project_store.load_scenario_state(path)
+        if scenario_state is not None:
+            try:
+                self.current_project_context = self._build_context_from_state(meta, scenario_state)
+                self.current_simulation_spec = self.current_project_context.simulation or self.current_simulation_spec
+                self.control_panel.load_simulation_spec(self.current_simulation_spec)
+            except Exception as exc:
+                self.append_log(f"\u52a0\u8f7d scenario_state \u5931\u8d25\uff1a{exc}")
+                self.current_simulation_spec = self.current_simulation_spec.model_copy(update={"additional_files": []})
+                self.control_panel.load_simulation_spec(self.current_simulation_spec)
+                self.current_project_context = ProjectContext(meta=meta, simulation=self.current_simulation_spec)
+        else:
+            self.current_simulation_spec = self.current_simulation_spec.model_copy(update={"additional_files": []})
+            self.control_panel.load_simulation_spec(self.current_simulation_spec)
+            self.current_project_context = ProjectContext(meta=meta, simulation=self.current_simulation_spec)
+        self._sync_signal_panel()
         self.append_log(f"\u5df2\u52a0\u8f7d\u9879\u76ee\uff1a{meta.name}")
         self.statusBar().showMessage(f"\u5f53\u524d\u9879\u76ee\uff1a{meta.name}")
         self._remember_recent_project(meta)
@@ -241,6 +276,8 @@ class MainWindow(QMainWindow):
             self.show_error("\u9879\u76ee\u540d\u79f0\u4e0d\u80fd\u4e3a\u7a7a\u3002")
             return
         meta = self.container.project_store.create_project(name, base_dir)
+        self.current_simulation_spec = self.current_simulation_spec.model_copy(update={"additional_files": []})
+        self.control_panel.load_simulation_spec(self.current_simulation_spec)
         self.current_project_meta = meta
         self.current_project_context = ProjectContext(
             meta=meta,
@@ -255,6 +292,7 @@ class MainWindow(QMainWindow):
         )
         self.append_log(f"\u5df2\u521b\u5efa\u9879\u76ee\uff1a{meta.name}")
         self.statusBar().showMessage(f"\u5f53\u524d\u9879\u76ee\uff1a{meta.name}")
+        self._sync_signal_panel()
         self._remember_recent_project(meta)
         self._refresh_history_panel()
 
@@ -394,6 +432,8 @@ class MainWindow(QMainWindow):
     ) -> None:
         if self._task_thread is not None:
             return
+        self._stop_reply_stream(finalize=True)
+        self._streamed_reply_text = ""
         self._task_kind = kind
         self._task_placeholder = self.chat_panel.append_status_message(placeholder_text)
         self.chat_panel.set_busy(True)
@@ -415,25 +455,34 @@ class MainWindow(QMainWindow):
         self._task_thread.start()
 
     def _on_task_progress(self, progress) -> None:
+        if getattr(progress, "kind", "status") == "stream":
+            self._append_stream_chunk(progress.message)
+            self.statusBar().showMessage("\u901a\u901a\u6b63\u5728\u8f93\u51fa\u56de\u590d...")
+            return
+        if self._reply_stream_row is not None:
+            self.statusBar().showMessage(progress.message)
+            return
         if self._task_placeholder is not None:
-            self.chat_panel.update_message(self._task_placeholder, "status", progress.message)
+            self._task_placeholder = self.chat_panel.update_message(self._task_placeholder, "status", progress.message)
         self.statusBar().showMessage(progress.message)
 
     def _on_task_succeeded(self, result: object) -> None:
         if isinstance(result, AgentExecutionResult):
             reply_text = result.reply_text.strip() if result.reply_text else "\u8bf7\u6c42\u5df2\u5904\u7406\uff0c\u4f46\u5f53\u524d\u6ca1\u6709\u8fd4\u56de\u8bf4\u660e\u3002"
-            if self._task_placeholder is not None:
-                self.chat_panel.replace_message(self._task_placeholder, "assistant", reply_text)
+            if self._streamed_reply_text:
+                self._finish_streamed_reply(reply_text)
+            elif self._task_placeholder is not None:
+                self._begin_reply_stream(reply_text, self._task_placeholder)
                 self._task_placeholder = None
             else:
-                self.chat_panel.append_agent_message(reply_text)
+                self._begin_reply_stream(reply_text)
             if self._task_kind == "draft_materialize":
                 self._cancel_pending_draft(announce=False)
             self._apply_agent_result(result)
             self.statusBar().showMessage(f"{result.assistant_name} \u5df2\u5b8c\u6210\u672c\u8f6e\u5904\u7406")
         elif isinstance(result, ImageAnalysisResult):
             if self._task_placeholder is not None:
-                self.chat_panel.replace_message(self._task_placeholder, "assistant", result.reply_text)
+                self._task_placeholder = self.chat_panel.replace_message(self._task_placeholder, "assistant", result.reply_text)
                 self._task_placeholder = None
             else:
                 self.chat_panel.append_agent_message(result.reply_text)
@@ -442,20 +491,134 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("\u56fe\u7247\u8bc6\u522b\u5df2\u5b8c\u6210")
         else:
             if self._task_placeholder is not None:
-                self.chat_panel.replace_message(self._task_placeholder, "assistant", str(result))
+                self._task_placeholder = self.chat_panel.replace_message(self._task_placeholder, "assistant", str(result))
                 self._task_placeholder = None
         self.chat_panel.set_busy(False)
 
     def _on_task_failed(self, error_message: str) -> None:
+        self._stop_reply_stream(finalize=True)
+        self._streamed_reply_text = ""
         message = f"\u5904\u7406\u4efb\u52a1\u65f6\u51fa\u9519\uff1a{error_message}"
         if self._task_placeholder is not None:
-            self.chat_panel.replace_message(self._task_placeholder, "assistant", message)
+            self._task_placeholder = self.chat_panel.replace_message(self._task_placeholder, "assistant", message)
             self._task_placeholder = None
         else:
             self.chat_panel.append_agent_message(message)
         self.append_log(f"\u540e\u53f0\u4efb\u52a1\u5f02\u5e38\uff1a{error_message}")
         self.chat_panel.set_busy(False)
         self.statusBar().showMessage("\u901a\u901a\u5904\u7406\u5931\u8d25")
+
+    def _append_stream_chunk(self, chunk: str) -> None:
+        if not chunk:
+            return
+        if self._reply_stream_row is None:
+            if self._task_placeholder is None:
+                self._reply_stream_row = self.chat_panel.append_agent_message("", render_markdown=False)
+            else:
+                self._reply_stream_row = self.chat_panel.replace_message(
+                    self._task_placeholder,
+                    "assistant",
+                    "",
+                    render_markdown=False,
+                )
+                self._task_placeholder = None
+            self._reply_stream_visible_text = ""
+            self._reply_stream_index = 0
+        self._streamed_reply_text += chunk
+        self._reply_stream_target_text += chunk
+        self._reply_stream_complete = False
+        if not self._reply_stream_timer.isActive():
+            self._reply_stream_timer.start()
+
+    def _finish_streamed_reply(self, final_text: str) -> None:
+        final_message = final_text or self._streamed_reply_text
+        if self._reply_stream_row is None:
+            self.chat_panel.append_agent_message(final_message)
+            self._task_placeholder = None
+            self._streamed_reply_text = ""
+            return
+        self._reply_stream_target_text = final_message
+        self._reply_stream_complete = True
+        if self._reply_stream_index >= len(self._reply_stream_target_text):
+            self._stop_reply_stream(finalize=True)
+        elif not self._reply_stream_timer.isActive():
+            self._reply_stream_timer.start()
+        self._streamed_reply_text = ""
+        self._task_placeholder = None
+
+    def _begin_reply_stream(self, text: str, row_widget: QWidget | None = None) -> None:
+        self._stop_reply_stream(finalize=True)
+        self._streamed_reply_text = ""
+        if row_widget is None:
+            row_widget = self.chat_panel.append_agent_message("", render_markdown=False)
+        else:
+            row_widget = self.chat_panel.replace_message(
+                row_widget,
+                "assistant",
+                "",
+                render_markdown=False,
+            )
+        self._reply_stream_row = row_widget
+        self._reply_stream_target_text = text or "\u8bf7\u6c42\u5df2\u5904\u7406\u3002"
+        self._reply_stream_visible_text = ""
+        self._reply_stream_index = 0
+        self._reply_stream_complete = True
+        if not self._reply_stream_timer.isActive():
+            self._reply_stream_timer.start()
+
+    def _advance_reply_stream(self) -> None:
+        if self._reply_stream_row is None:
+            self._reply_stream_timer.stop()
+            return
+        if self._reply_stream_index >= len(self._reply_stream_target_text):
+            if self._reply_stream_complete:
+                self._stop_reply_stream(finalize=True)
+            else:
+                self._reply_stream_timer.stop()
+            return
+        next_index = min(
+            len(self._reply_stream_target_text),
+            self._reply_stream_index + self._reply_stream_step_size(),
+        )
+        self._reply_stream_index = next_index
+        self._reply_stream_visible_text = self._reply_stream_target_text[: self._reply_stream_index]
+        self._reply_stream_row = self.chat_panel.update_message(
+            self._reply_stream_row,
+            "assistant",
+            self._reply_stream_visible_text,
+            render_markdown=False,
+            relayout=False,
+        )
+        if self._reply_stream_index >= len(self._reply_stream_target_text) and self._reply_stream_complete:
+            self._stop_reply_stream(finalize=True)
+
+    def _reply_stream_step_size(self) -> int:
+        backlog = len(self._reply_stream_target_text) - self._reply_stream_index
+        if backlog > 320:
+            return 4
+        if backlog > 120:
+            return 3
+        return 2
+
+    def _stop_reply_stream(self, finalize: bool) -> None:
+        if self._reply_stream_timer.isActive():
+            self._reply_stream_timer.stop()
+        if finalize and self._reply_stream_row is not None:
+            final_text = self._reply_stream_target_text or self._reply_stream_visible_text
+            finalized_row = self.chat_panel.replace_message(
+                self._reply_stream_row,
+                "assistant",
+                final_text,
+                render_markdown=True,
+            )
+            if self._task_placeholder is self._reply_stream_row:
+                self._task_placeholder = finalized_row
+            self._reply_stream_row = finalized_row
+        self._reply_stream_row = None
+        self._reply_stream_target_text = ""
+        self._reply_stream_visible_text = ""
+        self._reply_stream_index = 0
+        self._reply_stream_complete = False
 
     def _cleanup_task_worker(self) -> None:
         self._task_worker = None
@@ -480,6 +643,7 @@ class MainWindow(QMainWindow):
             self.current_project_meta = result.updated_project.meta
             self.current_simulation_spec = result.updated_project.simulation or self.current_simulation_spec
             self.control_panel.load_simulation_spec(self.current_simulation_spec)
+            self._sync_signal_panel()
             self.statusBar().showMessage(f"\u5f53\u524d\u9879\u76ee\uff1a{self.current_project_meta.name}")
             self._remember_recent_project(self.current_project_meta)
         if result.operation_summary:
@@ -498,11 +662,11 @@ class MainWindow(QMainWindow):
             if not self._ensure_project_built():
                 return
             if self.workspace_tabs is not None:
-                self.workspace_tabs.setCurrentIndex(1)
+                self.workspace_tabs.setCurrentIndex(2)
             self.append_log("Agent \u8bf7\u6c42\u76f4\u63a5\u8fd0\u884c\u4eff\u771f\u3002")
             self.container.sim_runner.start_project(Path(self.current_project_meta.project_dir))
         elif result.history_record_id is not None and self.workspace_tabs is not None:
-            self.workspace_tabs.setCurrentIndex(2)
+            self.workspace_tabs.setCurrentIndex(3)
 
     def _handle_run_requested(self) -> None:
         if self.container is None:
@@ -516,7 +680,7 @@ class MainWindow(QMainWindow):
         if not self._ensure_project_built():
             return
         if self.workspace_tabs is not None:
-            self.workspace_tabs.setCurrentIndex(1)
+            self.workspace_tabs.setCurrentIndex(2)
         self.append_log("\u6536\u5230\u8fd0\u884c\u8bf7\u6c42\uff0c\u51c6\u5907\u901a\u8fc7 TraCI \u542f\u52a8 SUMO\u3002")
         self.container.sim_runner.start_project(Path(self.current_project_meta.project_dir))
 
@@ -537,12 +701,16 @@ class MainWindow(QMainWindow):
             self.container.sim_runner.stop()
 
     def _handle_simulation_params_changed(self, spec: SimulationSpec) -> None:
+        spec = spec.model_copy(update={"additional_files": list(self.current_simulation_spec.additional_files)})
         self.current_simulation_spec = spec
         if self.current_project_context is not None:
             scenario_state = self.current_project_context.scenario_state
             if scenario_state is not None:
                 scenario_state = scenario_state.model_copy(update={"duration_seconds": spec.end_time, "step_length": spec.step_length, "seed": spec.seed})
+                if self.current_project_meta is not None and self.container is not None:
+                    self.container.project_store.save_scenario_state(Path(self.current_project_meta.project_dir), scenario_state)
             self.current_project_context = self.current_project_context.model_copy(update={"simulation": spec, "scenario_state": scenario_state})
+        self._sync_signal_panel()
         self.append_log(f"\u53c2\u6570\u5df2\u66f4\u65b0\uff1a\u65f6\u957f={spec.end_time}s, \u6b65\u957f={spec.step_length}, seed={spec.seed}")
 
     def _create_implicit_project_for_run(self) -> None:
@@ -550,6 +718,8 @@ class MainWindow(QMainWindow):
             return
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         meta = self.container.project_store.create_project(f"quick_run_{timestamp}")
+        self.current_simulation_spec = self.current_simulation_spec.model_copy(update={"additional_files": []})
+        self.control_panel.load_simulation_spec(self.current_simulation_spec)
         self.current_project_meta = meta
         self.current_project_context = ProjectContext(
             meta=meta,
@@ -563,6 +733,7 @@ class MainWindow(QMainWindow):
             ),
         )
         self.statusBar().showMessage(f"\u5f53\u524d\u9879\u76ee\uff1a{meta.name}")
+        self._sync_signal_panel()
         self._remember_recent_project(meta)
         self._refresh_history_panel()
         self.append_log(f"\u672a\u68c0\u6d4b\u5230\u5f53\u524d\u9879\u76ee\uff0c\u5df2\u81ea\u52a8\u521b\u5efa\u4e34\u65f6\u9879\u76ee\uff1a{meta.name}")
@@ -654,6 +825,43 @@ class MainWindow(QMainWindow):
             return
         item = RecentProjectItem(name=meta.name, project_dir=str(meta.project_dir), last_opened_at=datetime.now())
         self.container.recent_store.add_recent_project(item)
+
+    def _build_context_from_state(self, meta: ProjectMeta, state: ProjectScenarioState) -> ProjectContext:
+        if self.container is None:
+            return ProjectContext(meta=meta, scenario_state=state)
+        signal_enabled = state.signal_plan is not None and state.signal_plan.enabled
+        network = self.container.network_generator.generate(
+            NetworkGenerationRequest(
+                scenario_type=state.scenario_type,
+                lane_count=state.lane_count,
+                directional_lanes=state.directional_lanes,
+                road_length=state.road_length,
+                speed_limit=state.speed_limit,
+                signal_enabled=signal_enabled,
+            )
+        )
+        routes = self.container.route_generator.generate_routes(
+            network,
+            RouteGenerationRequest(
+                flow_level=state.flow_level,
+                flow_rate=state.flow_rate,
+                duration_seconds=state.duration_seconds,
+                traffic_bias=state.traffic_bias,
+            ),
+        )
+        simulation = self.container.config_generator.build_simulation_spec(
+            Path(meta.project_dir),
+            SimulationConfigRequest(
+                duration_seconds=state.duration_seconds,
+                step_length=state.step_length,
+                seed=state.seed,
+                additional_files=signal_additional_files(state.signal_plan),
+            ),
+        )
+        return ProjectContext(meta=meta, network=network, routes=routes, simulation=simulation, scenario_state=state)
+
+    def _sync_signal_panel(self) -> None:
+        self.signal_plan_panel.load_project(self.current_project_context)
 
     def _build_workspace_header(self) -> QFrame:
         card = QFrame()

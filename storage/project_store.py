@@ -6,13 +6,14 @@ from datetime import datetime
 from pathlib import Path
 
 from storage.path_utils import normalize_local_path
-from sumo_domain.project_spec import ProjectMeta
+from sumo_domain.project_spec import ProjectMeta, ProjectScenarioState
 
 
 class ProjectStore:
     """Manage project directories and their metadata files."""
 
     META_FILENAME = "project.json"
+    SCENARIO_STATE_FILENAME = "scenario_state.json"
 
     def __init__(self, base_projects_dir: Path) -> None:
         self.base_projects_dir = normalize_local_path(base_projects_dir)
@@ -61,6 +62,22 @@ class ProjectStore:
             meta = meta.model_copy(update={"project_dir": normalized_dir})
             self.save_project_meta(meta)
         return meta
+
+    def save_scenario_state(self, project_dir: Path, state: ProjectScenarioState) -> Path:
+        normalized_dir = normalize_local_path(project_dir)
+        normalized_dir.mkdir(parents=True, exist_ok=True)
+        state_path = normalized_dir / self.SCENARIO_STATE_FILENAME
+        payload = state.model_dump(mode="json")
+        state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return state_path
+
+    def load_scenario_state(self, project_dir: Path) -> ProjectScenarioState | None:
+        normalized_dir = normalize_local_path(project_dir)
+        state_path = normalized_dir / self.SCENARIO_STATE_FILENAME
+        if not state_path.exists():
+            return None
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        return ProjectScenarioState.model_validate(data)
 
     def list_project_files(self, path: Path) -> list[Path]:
         project_dir = normalize_local_path(path)

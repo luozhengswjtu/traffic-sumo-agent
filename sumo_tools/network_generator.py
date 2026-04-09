@@ -13,6 +13,7 @@ class NetworkGenerationRequest(BaseModel):
     road_length: float = 200.0
     speed_limit: float = 13.89
     node_type: str = "priority"
+    signal_enabled: bool = False
 
 
 class NetworkGenerator:
@@ -31,11 +32,11 @@ class NetworkGenerator:
     def generate_intersection(self, spec: NetworkGenerationRequest) -> NetworkSpec:
         half = spec.road_length / 2.0
         nodes = [
-            NodeSpec(id="center", x=0.0, y=0.0, type=spec.node_type),
-            NodeSpec(id="north", x=0.0, y=half, type=spec.node_type),
-            NodeSpec(id="south", x=0.0, y=-half, type=spec.node_type),
-            NodeSpec(id="west", x=-half, y=0.0, type=spec.node_type),
-            NodeSpec(id="east", x=half, y=0.0, type=spec.node_type),
+            NodeSpec(id="center", x=0.0, y=0.0, type=self._node_type(spec, is_center=True)),
+            NodeSpec(id="north", x=0.0, y=half, type=self._node_type(spec, is_center=False)),
+            NodeSpec(id="south", x=0.0, y=-half, type=self._node_type(spec, is_center=False)),
+            NodeSpec(id="west", x=-half, y=0.0, type=self._node_type(spec, is_center=False)),
+            NodeSpec(id="east", x=half, y=0.0, type=self._node_type(spec, is_center=False)),
         ]
         edges = [
             self._edge("north_in", "north", "center", spec),
@@ -52,10 +53,10 @@ class NetworkGenerator:
     def generate_t_junction(self, spec: NetworkGenerationRequest) -> NetworkSpec:
         half = spec.road_length / 2.0
         nodes = [
-            NodeSpec(id="center", x=0.0, y=0.0, type=spec.node_type),
-            NodeSpec(id="north", x=0.0, y=half, type=spec.node_type),
-            NodeSpec(id="west", x=-half, y=0.0, type=spec.node_type),
-            NodeSpec(id="east", x=half, y=0.0, type=spec.node_type),
+            NodeSpec(id="center", x=0.0, y=0.0, type=self._node_type(spec, is_center=True)),
+            NodeSpec(id="north", x=0.0, y=half, type=self._node_type(spec, is_center=False)),
+            NodeSpec(id="west", x=-half, y=0.0, type=self._node_type(spec, is_center=False)),
+            NodeSpec(id="east", x=half, y=0.0, type=self._node_type(spec, is_center=False)),
         ]
         edges = [
             self._edge("north_in", "north", "center", spec),
@@ -70,9 +71,9 @@ class NetworkGenerator:
     def generate_corridor(self, spec: NetworkGenerationRequest) -> NetworkSpec:
         half = spec.road_length / 2.0
         nodes = [
-            NodeSpec(id="center", x=0.0, y=0.0, type=spec.node_type),
-            NodeSpec(id="west", x=-half, y=0.0, type=spec.node_type),
-            NodeSpec(id="east", x=half, y=0.0, type=spec.node_type),
+            NodeSpec(id="center", x=0.0, y=0.0, type=self._node_type(spec, is_center=True)),
+            NodeSpec(id="west", x=-half, y=0.0, type=self._node_type(spec, is_center=False)),
+            NodeSpec(id="east", x=half, y=0.0, type=self._node_type(spec, is_center=False)),
         ]
         edges = [
             self._edge("west_in", "west", "center", spec),
@@ -93,3 +94,9 @@ class NetworkGenerator:
             speed=spec.speed_limit,
             length=spec.road_length / 2.0,
         )
+
+    @staticmethod
+    def _node_type(spec: NetworkGenerationRequest, is_center: bool) -> str:
+        if is_center and spec.signal_enabled:
+            return "traffic_light"
+        return spec.node_type

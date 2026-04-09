@@ -278,20 +278,24 @@ class MarkdownLabel(QLabel):
 class MessageBubble(QFrame):
     ROLE_TITLES = {"user": "You", "assistant": ASSISTANT_NAME, "agent": ASSISTANT_NAME, "status": ASSISTANT_NAME}
 
-    def __init__(self, role: str, text: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        role: str,
+        text: str,
+        parent: QWidget | None = None,
+        render_markdown: bool | None = None,
+    ) -> None:
         super().__init__(parent)
         self.role = role
         self.raw_text = text
+        self.render_markdown = self._resolve_render_markdown(role, render_markdown)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(6)
         self.role_label = QLabel(self.ROLE_TITLES.get(role, ASSISTANT_NAME))
         self.role_label.setObjectName("messageRole")
-        if role == "user":
-            self.content_widget: QLabel | MarkdownLabel = QLabel(text)
-            self.content_widget.setWordWrap(True)
-            self.content_widget.setTextFormat(Qt.PlainText)
-            self.content_widget.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        if role == "user" or not self.render_markdown:
+            self.content_widget: QLabel | MarkdownLabel = self._build_plain_label(text)
         else:
             self.content_widget = MarkdownLabel(role)
             self.content_widget.set_markdown_text(text)
@@ -306,15 +310,38 @@ class MessageBubble(QFrame):
         self.raw_text = text
         if isinstance(self.content_widget, QLabel):
             self.content_widget.setText(text)
+            self.content_widget.adjustSize()
             return
         self.content_widget.set_markdown_text(text)
 
     def apply_width(self, max_width: int) -> None:
         max_width = max(320, max_width)
-        self.setMaximumWidth(max_width)
+        if self.role in {"assistant", "agent"} and not self.render_markdown:
+            self.setMinimumWidth(max_width)
+            self.setMaximumWidth(max_width)
+        else:
+            self.setMinimumWidth(0)
+            self.setMaximumWidth(max_width)
         self.content_widget.setMaximumWidth(max_width - 32)
         if isinstance(self.content_widget, MarkdownLabel):
             self.content_widget.sync_layout()
+
+    @staticmethod
+    def _resolve_render_markdown(role: str, render_markdown: bool | None) -> bool:
+        if role == "user":
+            return False
+        if render_markdown is not None:
+            return render_markdown
+        return role not in {"status"}
+
+    @staticmethod
+    def _build_plain_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setTextFormat(Qt.PlainText)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        return label
 
     def _style_sheet(self) -> str:
         if self.role == "user":
@@ -520,8 +547,8 @@ class ChatPanel(QWidget):
     def append_user_message(self, text: str) -> QWidget:
         return self._append_widget(MessageBubble("user", text), align_right=True)
 
-    def append_agent_message(self, text: str) -> QWidget:
-        return self._append_widget(MessageBubble("assistant", text))
+    def append_agent_message(self, text: str, render_markdown: bool = True) -> QWidget:
+        return self._append_widget(MessageBubble("assistant", text, render_markdown=render_markdown))
 
     def append_status_message(self, text: str) -> QWidget:
         return self._append_widget(MessageBubble("status", text))
@@ -547,17 +574,32 @@ class ChatPanel(QWidget):
         self._draft_row = None
         self._scroll_to_bottom()
 
-    def update_message(self, row_widget: QWidget, role: str, text: str) -> QWidget:
+    def update_message(
+        self,
+        row_widget: QWidget,
+        role: str,
+        text: str,
+        render_markdown: bool | None = None,
+        relayout: bool = True,
+    ) -> QWidget:
         bubble = row_widget.findChild(MessageBubble)
-        if bubble is None or bubble.role != role:
-            return self.replace_widget(row_widget, MessageBubble(role, text))
+        expected_render_markdown = MessageBubble._resolve_render_markdown(role, render_markdown)
+        if bubble is None or bubble.role != role or bubble.render_markdown != expected_render_markdown:
+            return self.replace_widget(row_widget, MessageBubble(role, text, render_markdown=render_markdown))
         bubble.set_text(text)
-        self._update_bubble_widths()
+        if relayout:
+            self._update_bubble_widths()
         self._scroll_to_bottom()
         return row_widget
 
-    def replace_message(self, row_widget: QWidget, role: str, text: str) -> QWidget:
-        return self.replace_widget(row_widget, MessageBubble(role, text))
+    def replace_message(
+        self,
+        row_widget: QWidget,
+        role: str,
+        text: str,
+        render_markdown: bool | None = None,
+    ) -> QWidget:
+        return self.replace_widget(row_widget, MessageBubble(role, text, render_markdown=render_markdown))
 
     def replace_widget(self, row_widget: QWidget, inner: QWidget) -> QWidget:
         index = self.messages_layout.indexOf(row_widget)

@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.base import TaskResult
+from autogen_agentchat.messages import ModelClientStreamingChunkEvent
 from autogen_core.tools import FunctionTool
 
 from agent.tool_registry import ToolRegistry
@@ -46,14 +47,23 @@ class AutoGenAssistantBridge:
         text: str,
         system_message: str,
         runtime_context: dict[str, Any] | None = None,
+        stream_callback: Callable[[str], None] | None = None,
     ) -> AutoGenRunResult:
-        return asyncio.run(self._run_async(text=text, system_message=system_message, runtime_context=runtime_context))
+        return asyncio.run(
+            self._run_async(
+                text=text,
+                system_message=system_message,
+                runtime_context=runtime_context,
+                stream_callback=stream_callback,
+            )
+        )
 
     async def _run_async(
         self,
         text: str,
         system_message: str,
         runtime_context: dict[str, Any] | None = None,
+        stream_callback: Callable[[str], None] | None = None,
     ) -> AutoGenRunResult:
         tool_runs: list[AutoGenToolRun] = []
         issues: list[str] = []
@@ -65,11 +75,15 @@ class AutoGenAssistantBridge:
                 model_client=client,
                 tools=self._build_tools(tool_runs, issues, current_context),
                 system_message=system_message,
+                model_client_stream=stream_callback is not None,
                 reflect_on_tool_use=False,
                 max_tool_iterations=1,
                 tool_call_summary_format="{result}",
             )
-            task_result = await agent.run(task=text)
+            if stream_callback is None:
+                task_result = await agent.run(task=text)
+            else:
+                task_result = await self._run_with_stream(agent, text, stream_callback)
         finally:
             await client.close()
         return AutoGenRunResult(
@@ -77,6 +91,24 @@ class AutoGenAssistantBridge:
             tool_runs=tool_runs,
             issues=issues,
         )
+
+    @staticmethod
+    async def _run_with_stream(
+        agent: AssistantAgent,
+        text: str,
+        stream_callback: Callable[[str], None],
+    ) -> TaskResult:
+        task_result: TaskResult | None = None
+        async for item in agent.run_stream(task=text, output_task_messages=False):
+            if isinstance(item, ModelClientStreamingChunkEvent):
+                if item.content:
+                    stream_callback(str(item.content))
+                continue
+            if isinstance(item, TaskResult):
+                task_result = item
+        if task_result is None:
+            raise RuntimeError("模型未返回最终结果。")
+        return task_result
 
     def _build_tools(
         self,
@@ -129,11 +161,20 @@ class AutoGenAssistantBridge:
             flow_multiplier: float | None = None,
             traffic_bias: str | None = None,
             seed: int | None = None,
+            signal_enabled: bool | None = None,
+            signal_plan_name: str | None = None,
+            signal_cycle_seconds: int | None = None,
+            signal_offset_seconds: int | None = None,
+            signal_yellow_seconds: int | None = None,
+            signal_all_red_seconds: int | None = None,
+            signal_ns_green_seconds: int | None = None,
+            signal_ew_green_seconds: int | None = None,
             reset_traffic_bias: bool | None = None,
             reset_seed: bool | None = None,
             reset_flow_to_default: bool | None = None,
             reset_duration_to_default: bool | None = None,
             reset_step_length_to_default: bool | None = None,
+            reset_signal_plan: bool | None = None,
             should_run_simulation: bool | None = None,
             project_name: str | None = None,
         ) -> str:
@@ -154,11 +195,20 @@ class AutoGenAssistantBridge:
                     "flow_multiplier": flow_multiplier,
                     "traffic_bias": traffic_bias,
                     "seed": seed,
+                    "signal_enabled": signal_enabled,
+                    "signal_plan_name": signal_plan_name,
+                    "signal_cycle_seconds": signal_cycle_seconds,
+                    "signal_offset_seconds": signal_offset_seconds,
+                    "signal_yellow_seconds": signal_yellow_seconds,
+                    "signal_all_red_seconds": signal_all_red_seconds,
+                    "signal_ns_green_seconds": signal_ns_green_seconds,
+                    "signal_ew_green_seconds": signal_ew_green_seconds,
                     "reset_traffic_bias": reset_traffic_bias,
                     "reset_seed": reset_seed,
                     "reset_flow_to_default": reset_flow_to_default,
                     "reset_duration_to_default": reset_duration_to_default,
                     "reset_step_length_to_default": reset_step_length_to_default,
+                    "reset_signal_plan": reset_signal_plan,
                     "should_run_simulation": should_run_simulation,
                     "project_name": project_name,
                 },

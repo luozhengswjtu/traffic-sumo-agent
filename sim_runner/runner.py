@@ -6,6 +6,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from sim_runner.process_manager import SumoProcessManager
 from sim_runner.state import RunnerStatus
+from sumo_domain.signal_plan import SignalRuntimeStatus
 from sumo_domain.simulation_spec import SimulationRuntimeState
 from sumo_tools.validator import SumoProjectValidator
 
@@ -35,6 +36,7 @@ class SimulationRunner(QObject):
             vehicle_count=0,
             average_speed=None,
             message="等待启动仿真",
+            signal_status=None,
         )
         self._monitor_timer = QTimer(self)
         self._monitor_timer.setInterval(500)
@@ -124,6 +126,7 @@ class SimulationRunner(QObject):
             vehicle_count=self._state.vehicle_count,
             average_speed=self._state.average_speed,
             message="SUMO 进程已停止。",
+            signal_status=None,
         )
         self.stateChanged.emit(self._state)
         self.logProduced.emit("SUMO 进程已停止。")
@@ -195,6 +198,7 @@ class SimulationRunner(QObject):
             vehicle_count=vehicle_count,
             average_speed=average_speed,
             message=message,
+            signal_status=self._read_signal_status(),
         )
         self.stateChanged.emit(self._state)
 
@@ -227,6 +231,7 @@ class SimulationRunner(QObject):
                 vehicle_count=self._state.vehicle_count,
                 average_speed=self._state.average_speed,
                 message="SUMO 正常退出。",
+                signal_status=None,
             )
             self.stateChanged.emit(self._state)
             if stdout_text.strip():
@@ -299,7 +304,29 @@ class SimulationRunner(QObject):
             vehicle_count=self._state.vehicle_count,
             average_speed=self._state.average_speed,
             message=message,
+            signal_status=None,
         )
         self.stateChanged.emit(self._state)
         self.logProduced.emit(f"运行错误：{message}")
         self.runFailed.emit(message)
+
+    def _read_signal_status(self) -> SignalRuntimeStatus | None:
+        if self._traci_connection is None:
+            return None
+        try:
+            tls_ids = list(self._traci_connection.trafficlight.getIDList())
+        except Exception:
+            return None
+        if not tls_ids:
+            return None
+        tls_id = tls_ids[0]
+        try:
+            return SignalRuntimeStatus(
+                tls_id=tls_id,
+                program_id=str(self._traci_connection.trafficlight.getProgram(tls_id)),
+                phase_index=int(self._traci_connection.trafficlight.getPhase(tls_id)),
+                phase_name=str(self._traci_connection.trafficlight.getPhaseName(tls_id) or ""),
+                next_switch_time=float(self._traci_connection.trafficlight.getNextSwitch(tls_id)),
+            )
+        except Exception:
+            return None

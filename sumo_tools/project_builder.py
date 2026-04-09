@@ -10,6 +10,7 @@ from sumo_domain.route_spec import RouteSpec
 from sumo_domain.simulation_spec import SimulationSpec
 from sumo_tools.config_generator import ConfigGenerator
 from sumo_tools.netconvert_service import NetconvertService
+from sumo_tools.signal_logic import TLS_ADDITIONAL_FILENAME, write_signal_additional_file
 from sumo_tools.validator import BuildResult, SumoProjectValidator, ValidationIssue
 
 
@@ -21,6 +22,7 @@ class ProjectBuilder:
         "scenario.edg.xml",
         "scenario.rou.xml",
         "scenario.net.xml",
+        TLS_ADDITIONAL_FILENAME,
         "scenario.sumocfg",
     )
 
@@ -40,6 +42,8 @@ class ProjectBuilder:
 
         if context.network is None or context.routes is None or context.simulation is None:
             return BuildResult(generated_files=generated_files, issues=issues)
+        if any(issue.level == "error" for issue in issues):
+            return BuildResult(generated_files=generated_files, issues=issues)
 
         project_dir = normalize_local_path(context.meta.project_dir)
         self._clear_previous_outputs(project_dir)
@@ -53,6 +57,10 @@ class ProjectBuilder:
 
             net_file = self.netconvert_service.build_net_file(project_dir, node_file, edge_file)
             generated_files.append(net_file)
+
+            signal_file = self.write_signal_file(project_dir, net_file, context)
+            if signal_file is not None:
+                generated_files.append(signal_file)
 
             config_file = self.write_config_file(project_dir, context.simulation)
             generated_files.append(config_file)
@@ -135,6 +143,15 @@ class ProjectBuilder:
         sumo_dir.mkdir(parents=True, exist_ok=True)
         config_path = sumo_dir / "scenario.sumocfg"
         return self.config_generator.write_sumocfg(config_path, simulation)
+
+    def write_signal_file(self, project_dir: Path, net_file: Path, context: ProjectContext) -> Path | None:
+        signal_plan = context.scenario_state.signal_plan if context.scenario_state else None
+        if signal_plan is None or not signal_plan.enabled:
+            return None
+        sumo_dir = normalize_local_path(project_dir / "sumo")
+        sumo_dir.mkdir(parents=True, exist_ok=True)
+        output_path = sumo_dir / TLS_ADDITIONAL_FILENAME
+        return write_signal_additional_file(net_file, output_path, signal_plan)
 
     def _clear_previous_outputs(self, project_dir: Path) -> None:
         sumo_dir = normalize_local_path(project_dir / "sumo")
