@@ -4,8 +4,8 @@ from pathlib import Path
 import html
 import re
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -376,6 +376,8 @@ class WelcomeCard(QFrame):
 
 
 class ImageBubble(QFrame):
+    PREVIEW_SIZE = QSize(260, 180)
+
     def __init__(self, image_path: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("imageBubble")
@@ -384,12 +386,12 @@ class ImageBubble(QFrame):
         layout.setSpacing(8)
         title = QLabel("\u5df2\u4e0a\u4f20\u56fe\u7247")
         title.setObjectName("imageTitle")
-        pixmap = QPixmap(image_path)
         preview = QLabel()
         preview.setObjectName("imagePreview")
         preview.setAlignment(Qt.AlignCenter)
+        pixmap = self._load_preview_pixmap(image_path)
         if not pixmap.isNull():
-            preview.setPixmap(pixmap.scaled(260, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            preview.setPixmap(pixmap)
         meta = QLabel(Path(image_path).name)
         meta.setObjectName("imageMeta")
         meta.setWordWrap(True)
@@ -397,6 +399,19 @@ class ImageBubble(QFrame):
         layout.addWidget(preview)
         layout.addWidget(meta)
         self.setStyleSheet("""QFrame#imageBubble { background: #FFFFFF; border: 1px solid #E6EBF2; border-radius: 18px; } QLabel#imageTitle { color: #475569; font-size: 11px; font-weight: 700; } QLabel#imageMeta { color: #334155; font-size: 12px; } QLabel#imagePreview { background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 14px; min-height: 120px; }""")
+
+    @classmethod
+    def _load_preview_pixmap(cls, image_path: str) -> QPixmap:
+        reader = QImageReader(image_path)
+        reader.setAutoTransform(True)
+        original_size = reader.size()
+        if original_size.isValid():
+            scaled_size = original_size.scaled(cls.PREVIEW_SIZE, Qt.KeepAspectRatio)
+            reader.setScaledSize(scaled_size)
+        image = reader.read()
+        if image.isNull():
+            return QPixmap()
+        return QPixmap.fromImage(image)
 
 
 class DraftPreviewCard(QFrame):

@@ -53,6 +53,7 @@ def build_autogen_chat_completion_client(config: ModelConfig) -> OpenAIChatCompl
         base_url=_normalize_base_url(config.base_url),
         timeout=float(config.timeout_seconds),
         temperature=_effective_temperature(config),
+        extra_body=_extra_body(config),
         parallel_tool_calls=False,
         include_name_in_message=False,
         model_info={
@@ -80,9 +81,18 @@ def _normalize_base_url(base_url: str) -> str:
 
 def _effective_temperature(config: ModelConfig) -> float | None:
     model_name = config.model.strip().lower()
+    if model_name.startswith("kimi-k2.6"):
+        return 0.6
     if model_name.startswith("kimi-k2.5"):
         return 1.0
     return config.temperature
+
+
+def _extra_body(config: ModelConfig) -> dict[str, Any] | None:
+    model_name = config.model.strip().lower()
+    if model_name.startswith("kimi-k2.6"):
+        return {"thinking": {"type": "disabled"}}
+    return None
 
 
 def _convert_messages(messages: list[ChatMessage]) -> list[Any]:

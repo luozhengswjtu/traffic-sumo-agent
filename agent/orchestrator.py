@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice, Qt
+from PySide6.QtGui import QImageReader
 from pydantic import BaseModel, Field
 
 from agent.autogen_bridge import AutoGenAssistantBridge, AutoGenToolRun
@@ -87,6 +89,15 @@ class AssistantProgress:
     stage: str
     message: str
     kind: str = "status"
+
+
+@dataclass(slots=True)
+class PreparedImagePayload:
+    data_uri: str
+    original_bytes: int
+    prepared_bytes: int
+    width: int | None = None
+    height: int | None = None
 
 
 @dataclass(slots=True)
@@ -1677,10 +1688,10 @@ class AgentOrchestrator:
         lanes = self._extract_directional_lane_updates(text)
         if lanes.has_any():
             patch["directional_lanes"] = lanes.model_dump(exclude_none=True)
-        length_match = re.search(r"(?:??|????|????)(?:?|=|??|??|??|???|???)?\s*(\d+(?:\.\d+)?)\s*(?:?|m)?", text, re.IGNORECASE)
+        length_match = re.search(r"(?:长度|道路长度|路段长度)(?:为|=|改成|改为|设为|设置为|调整为)?\s*(\d+(?:\.\d+)?)\s*(?:米|m)?", text, re.IGNORECASE)
         if length_match:
             patch["road_length_m"] = float(length_match.group(1))
-        speed_match = re.search(r"(?:??|??)(?:?|=|??|??|??|???|???)?\s*(\d+(?:\.\d+)?)\s*(km/h|kmh|??/??|m/s)?", text, re.IGNORECASE)
+        speed_match = re.search(r"(?:限速|速度)(?:为|=|改成|改为|设为|设置为|调整为)?\s*(\d+(?:\.\d+)?)\s*(km/h|kmh|公里/小时|m/s)?", text, re.IGNORECASE)
         if speed_match:
             speed_value = float(speed_match.group(1))
             unit = (speed_match.group(2) or "").lower()
@@ -1715,20 +1726,20 @@ class AgentOrchestrator:
             "intersection": "intersection",
             "cross": "intersection",
             "crossroad": "intersection",
-            "??": "intersection",
-            "????": "intersection",
+            "十字": "intersection",
+            "十字路口": "intersection",
             "t": "t_junction",
             "t_junction": "t_junction",
             "t-junction": "t_junction",
-            "t?": "t_junction",
-            "??": "t_junction",
-            "????": "t_junction",
+            "t字": "t_junction",
+            "丁字": "t_junction",
+            "t字路口": "t_junction",
             "corridor": "corridor",
             "straight": "corridor",
             "road": "corridor",
-            "??": "corridor",
-            "??": "corridor",
-            "??": "corridor",
+            "直线": "corridor",
+            "路段": "corridor",
+            "直线路段": "corridor",
         }
         return mapping.get(lowered)
 
@@ -1749,22 +1760,25 @@ class AgentOrchestrator:
         return f"\u7edf\u4e00\u8f66\u9053\u6570 {state.lane_count}"
 
     def _analyze_image_with_model(self, image_file: Path, project_summary: str | None) -> dict[str, Any]:
-        client = self.model_client_factory.create(self.get_model_config())
-        data_uri = self._image_to_data_uri(image_file)
+        prepared_image = self._image_to_data_uri(image_file)
+        model_config = self.get_model_config()
+        if model_config.timeout_seconds > 60:
+            model_config = model_config.model_copy(update={"timeout_seconds": 60})
+        client = self.model_client_factory.create(model_config)
         messages = [
             ChatMessage(role="system", content=build_image_analysis_system_prompt(self.get_user_preferences())),
             ChatMessage(
                 role="user",
                 content=[
                     MessageContentPart.text_part(build_image_analysis_user_prompt(project_summary)),
-                    MessageContentPart.image_part(data_uri),
+                    MessageContentPart.image_part(prepared_image),
                 ],
             ),
         ]
         response = client.chat(messages)
         payload = self._extract_json_object(response.text)
         if payload is None:
-            raise ValueError("???????????? JSON ???")
+            raise ValueError("模型未返回可解析的 JSON 对象")
         return payload
 
     def _patch_draft_with_model(self, text: str, draft: IntersectionImageDraft, project_summary: str | None) -> dict[str, Any] | None:
@@ -1816,7 +1830,50 @@ class AgentOrchestrator:
 
     @staticmethod
     def _image_to_data_uri(image_file: Path) -> str:
+        return AgentOrchestrator._prepare_image_for_model(image_file).data_uri
+
+    @staticmethod
+    def _prepare_image_for_model(image_file: Path) -> PreparedImagePayload:
+        original_bytes = image_file.stat().st_size
+        reader = QImageReader(str(image_file))
+        reader.setAutoTransform(True)
+        original_size = reader.size()
+        max_side = 1600
+        if original_size.isValid():
+            scaled_size = original_size
+            if max(original_size.width(), original_size.height()) > max_side:
+                scaled_size = original_size.scaled(max_side, max_side, Qt.KeepAspectRatio)
+                reader.setScaledSize(scaled_size)
+        image = reader.read()
+        if image.isNull():
+            return AgentOrchestrator._raw_image_payload(image_file, original_bytes)
+
+        output = QByteArray()
+        buffer = QBuffer(output)
+        buffer.open(QIODevice.WriteOnly)
+        saved = image.save(buffer, "JPEG", 82)
+        buffer.close()
+        if not saved or output.isEmpty():
+            return AgentOrchestrator._raw_image_payload(image_file, original_bytes)
+
+        encoded = base64.b64encode(bytes(output)).decode("ascii")
+        return PreparedImagePayload(
+            data_uri=f"data:image/jpeg;base64,{encoded}",
+            original_bytes=original_bytes,
+            prepared_bytes=output.size(),
+            width=image.width(),
+            height=image.height(),
+        )
+
+    @staticmethod
+    def _raw_image_payload(image_file: Path, original_bytes: int | None = None) -> PreparedImagePayload:
+        if original_bytes is None:
+            original_bytes = image_file.stat().st_size
         mime_type, _ = mimetypes.guess_type(str(image_file))
         mime_type = mime_type or "image/png"
         encoded = base64.b64encode(image_file.read_bytes()).decode("ascii")
-        return f"data:{mime_type};base64,{encoded}"
+        return PreparedImagePayload(
+            data_uri=f"data:{mime_type};base64,{encoded}",
+            original_bytes=original_bytes,
+            prepared_bytes=original_bytes,
+        )
